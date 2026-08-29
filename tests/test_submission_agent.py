@@ -654,11 +654,15 @@ class MultiQueryRetrievalTest(unittest.TestCase):
         """A single OR-of-everything query lets BM25 favour documents matching
         many common terms; a rare constraint can then contribute nothing."""
         agent = build_agent()
-        agent.reset("s", {})
-        agent.respond("s", "I'm looking for Men Boots.", 1, 10)
-        state = agent._sessions["s"]
-        state.anchor = None
-        state.anchor_set = frozenset()
-        agent._add_constraint(state, "Waterproof membrane")
-        pool = agent._build_pool(state, 10)
-        self.assertIn("A002", pool)
+        agent_module.FEATURE_MULTI_QUERY = True
+        try:
+            agent.reset("s", {})
+            agent.respond("s", "I'm looking for Men Boots.", 1, 10)
+            state = agent._sessions["s"]
+            state.anchor = None
+            state.anchor_set = frozenset()
+            agent._add_constraint(state, "Waterproof membrane")
+            pool = agent._build_pool(state, 10)
+            self.assertIn("A002", pool)
+        finally:
+            agent_module.FEATURE_MULTI_QUERY = False

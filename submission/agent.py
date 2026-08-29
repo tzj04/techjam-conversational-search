@@ -229,7 +229,13 @@ FEATURE_REGIME_ESCAPE = True
 #   constraint whose vocabulary is rare can contribute no candidates at all.
 #   At L3b that is 5 of 12 remaining misses, where the target never enters the
 #   pool. One query per constraint guarantees each contributes independently.
-FEATURE_MULTI_QUERY = True
+#   CUT on measurement: it does fix recall, but the extra candidates cost more
+#   in precision than the recovered targets are worth. Holding everything else
+#   constant, L3b fell 0.871357 -> 0.858485 with hit 0.935 -> 0.915, while
+#   clean and L3a were unchanged to six decimals. Diagnosing the cause
+#   correctly (5 of 12 L3b misses never enter the pool) did not make the
+#   obvious remedy net-positive. Retained behind the flag with its delta.
+FEATURE_MULTI_QUERY = False
 MULTI_QUERY_LIMIT = 120
 
 # Partial matching. Sub-additive in coverage so a full substring match always
