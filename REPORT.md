@@ -191,12 +191,29 @@ matches and so fails in the same correlated way the reranker does — which is w
 
 ## 6. Limitations
 
-1. **The paraphrase harness shares authorship with the agent.** Near-zero degradation partly
-   reflects shared assumptions about paraphrase families. The suffix anchor scan and lowercasing
-   normal form are robust by construction, but an adversarial paraphraser that reworded
-   *constraint payloads semantically* (synonyms, unit changes) would evade lexical matching
-   entirely. That residual risk is unmeasured; dense retrieval (plan Stage 4) was deliberately
-   skipped because the measured residual on this harness (~0.3 points) left it nothing to insure.
+1. **Semantic payload rewriting — measured, and it was the real exposure.** L1/L2 showed near-zero
+   degradation, but that reflected shared assumptions, not robustness: L2's payload mutations are
+   no-ops against this agent by construction (§3). The L3 harness rewrites payloads semantically,
+   and the Stage 3 agent degrades materially under it:
+
+   | | clean | L3a (payloads rewritten) | L3b (category tail too) |
+   |---|---|---|---|
+   | Stage 3 | 0.962179 (hit 1.000) | 0.887002 (hit 0.963) | 0.832112 (hit 0.925) |
+   | Stage 4 | 0.963479 (hit 1.000) | **0.940572 (hit 0.993)** | **0.871357 (hit 0.935)** |
+
+   The named mechanism is that `constraint.norm in text` is all-or-nothing, so a payload reworded
+   anywhere scores exactly as badly as an unrelated product; the constraint then subtracts
+   `UNMATCHED_PENALTY` from every candidate including the target, `ALL_MATCHED_BONUS` never fires,
+   and ranking inside the anchor collapses to popularity order. §4.1 addresses that mechanism
+   directly. Dense retrieval was still not needed: the residual is lexical, and graded lexical
+   matching closes most of it at zero clean cost.
+
+   **The caveat survives the fix.** The L3 rewriter shares authorship with the agent exactly as
+   L1/L2 did. These are measurements on our own instrument, not a guarantee about an organizer's.
+   What can be claimed without the instrument is narrower and still useful: every change in §4.1
+   replaces a *binary* decision that silently discards information with a graded one, and each is
+   clean-neutral or better by construction, so none of them trades public-set score for a
+   speculative private-set gain.
 2. **The core signals assume spec-faithful card construction.** Exact-substring and anchor
    dominance rely on the evaluator building intent cards from target metadata (spec-guaranteed).
    A differently generated private set weakens them; the BM25 and loose-term fallbacks then carry.
@@ -205,6 +222,25 @@ matches and so fails in the same correlated way the reranker does — which is w
 4. **Gating trades speed for rank by design:** MTTC rose 1.55 → 2.095. At 0.02 score per turn vs
    0.3 per unit of reciprocal rank, the trade is strongly positive, but MTTC-sensitive judges
    should note it is deliberate.
+5. **The clean set is nearly saturated, and the remainder is mostly unreachable.** Hit-rate is
+   exhausted at 1.000 and MTTC is at its policy floor, not near it (override sessions cannot
+   convert before the evaluator fires the override on turn 3 or 4: floor 3.667 against 3.733
+   measured; boundary sessions lose turn 2 to the one-off by construction). That leaves ~0.0163,
+   almost all of it MRR, and a practical ceiling near **0.9785**. Replaying the 17 sub-rank-1
+   sessions through the shadow evaluator shows **15 have flat rank trajectories across all ten
+   turns** — every card constraint revealed, rank unmoved. They are ties among products that match
+   every constraint (`public_0083`: 31 of 681 anchor-set products match all four of `polyester`,
+   `100% Polyester`, `Imported`, `Button closure`), broken by the popularity prior. No policy
+   change reaches them, and tuning for the two that would improve is overfitting to two sessions.
+   Effort therefore went to robustness, where the measured headroom was ~9× larger. Full working:
+   `docs/headroom_and_robustness.md`.
+6. **The budget path is entirely untested by every number in this report.** `intent_card` appends
+   `budget around $X` after the material/colour inserts and the features/details entries, so it
+   falls outside `cleaned[:4]` for all 200 public targets: **zero budget constraints are ever
+   revealed**. The same generator makes it equally unreachable on the private set, so the risk is
+   dead weight rather than error — but `BUDGET_*` weights and `_budget_score` have never executed
+   on real data. The misrouting guard in §4.1 exists because the *classifier* in front of that
+   path did fire, on ordinary features text.
 
 ## 7. Reproduction
 
