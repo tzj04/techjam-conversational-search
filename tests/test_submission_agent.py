@@ -647,3 +647,18 @@ class InfixAnchorTest(unittest.TestCase):
     def test_infix_never_matches_a_lone_short_token(self):
         agent = build_agent()
         self.assertIsNone(agent._anchor_infix("I am on it"))
+
+
+class MultiQueryRetrievalTest(unittest.TestCase):
+    def test_each_constraint_contributes_candidates_independently(self):
+        """A single OR-of-everything query lets BM25 favour documents matching
+        many common terms; a rare constraint can then contribute nothing."""
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Men Boots.", 1, 10)
+        state = agent._sessions["s"]
+        state.anchor = None
+        state.anchor_set = frozenset()
+        agent._add_constraint(state, "Waterproof membrane")
+        pool = agent._build_pool(state, 10)
+        self.assertIn("A002", pool)

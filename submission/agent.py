@@ -224,6 +224,13 @@ FEATURE_FIELD_WEIGHT = True
 FEATURE_INFIX_ANCHOR = True
 FEATURE_FUZZY_ANCHOR = True
 FEATURE_REGIME_ESCAPE = True
+# MULTI_QUERY: retrieval fires a single FTS query built as an OR of up to 40
+#   terms, so BM25 favours documents matching many *common* terms and a
+#   constraint whose vocabulary is rare can contribute no candidates at all.
+#   At L3b that is 5 of 12 remaining misses, where the target never enters the
+#   pool. One query per constraint guarantees each contributes independently.
+FEATURE_MULTI_QUERY = True
+MULTI_QUERY_LIMIT = 120
 
 # Partial matching. Sub-additive in coverage so a full substring match always
 # dominates any partial one; below PARTIAL_MIN coverage nothing is awarded.
@@ -816,18 +823,34 @@ class Agent:
         if state.anchor:
             pool.extend(state.anchor)
             seen.update(state.anchor)
-        query_terms: list[str] = []
-        for constraint in state.constraints:
-            query_terms.extend(_terms(constraint.verbatim))
-        query_terms.extend(state.category_terms)
-        query_terms.extend(state.loose_terms)
-        deduped = list(dict.fromkeys(query_terms))[:40]
-        if deduped:
-            expression = " OR ".join(f'"{term}"' for term in deduped)
-            for parent_asin in self._fts_search(expression, 300):
-                if parent_asin not in seen:
-                    seen.add(parent_asin)
-                    pool.append(parent_asin)
+        if FEATURE_MULTI_QUERY:
+            groups: list[list[str]] = [
+                _terms(constraint.verbatim) for constraint in state.constraints
+                if not constraint.is_budget
+            ]
+            groups.append(list(state.category_terms) + list(state.loose_terms))
+            for group in groups:
+                terms = list(dict.fromkeys(group))[:20]
+                if not terms:
+                    continue
+                expression = " OR ".join(f'"{term}"' for term in terms)
+                for parent_asin in self._fts_search(expression, MULTI_QUERY_LIMIT):
+                    if parent_asin not in seen:
+                        seen.add(parent_asin)
+                        pool.append(parent_asin)
+        else:
+            query_terms: list[str] = []
+            for constraint in state.constraints:
+                query_terms.extend(_terms(constraint.verbatim))
+            query_terms.extend(state.category_terms)
+            query_terms.extend(state.loose_terms)
+            deduped = list(dict.fromkeys(query_terms))[:40]
+            if deduped:
+                expression = " OR ".join(f'"{term}"' for term in deduped)
+                for parent_asin in self._fts_search(expression, 300):
+                    if parent_asin not in seen:
+                        seen.add(parent_asin)
+                        pool.append(parent_asin)
         if len(pool) < max(30, top_k * 3):
             for parent_asin in self._fallback_order:
                 if parent_asin not in seen:
