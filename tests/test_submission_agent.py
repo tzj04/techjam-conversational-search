@@ -670,3 +670,24 @@ class MultiQueryRetrievalTest(unittest.TestCase):
             self.assertIn("A002", pool)
         finally:
             agent_module.FEATURE_MULTI_QUERY = False
+
+
+class DocumentFrequencyTest(unittest.TestCase):
+    def test_doc_freq_uses_the_same_tokenizer_as_coverage(self):
+        """_coverage looks tokens up by `_terms` output. If _doc_freq were
+        built by splitting the normal form it would key numeric tokens as
+        "100%" while lookups ask for "100", making common numbers look
+        maximally rare -- and percentage constraints are mostly numbers."""
+        agent = build_agent()
+        for token in agent._doc_freq:
+            self.assertEqual([token], _terms_of(token), token)
+
+    def test_numeric_token_frequency_is_counted(self):
+        agent = build_agent()
+        # "100% Cotton" appears in A001's features and details.
+        self.assertGreater(agent._doc_freq.get("100", 0), 0)
+
+
+def _terms_of(text):
+    from submission.agent import _terms
+    return _terms(text)

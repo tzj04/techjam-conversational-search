@@ -313,6 +313,7 @@ class Agent:
 
     def _build_index(self) -> None:
         cursor = self.connection.cursor()
+        doc_freq = self._doc_freq
         cursor.execute(
             "CREATE VIRTUAL TABLE products USING fts5("
             "parent_asin UNINDEXED, title, categories, features, details, store, description, "
@@ -340,14 +341,16 @@ class Agent:
                 for field_name in ("features", "details"):
                     card_parts.extend(_flatten_field(product.get(field_name)))
                 self._card_text[parent_asin] = normalize_text(" ".join(card_parts))
-                # Token-delimited view for `_coverage`. It must be built with
-                # the same tokenizer the constraint side uses: `_terms` strips
-                # the `%` that the normal form deliberately keeps inside
-                # numbers, so testing " 100 " against the raw normal form
-                # ("100% cotton") would never match.
-                self._token_text[parent_asin] = " %s " % " ".join(
-                    sorted(set(_terms(self._norm_text[parent_asin])))
-                )
+                # Token-delimited view for `_coverage`, and the document
+                # frequencies that weight it. BOTH must use the same tokenizer
+                # the constraint side uses: `_terms` strips the `%` and `.`
+                # that the normal form deliberately keeps inside numbers, so a
+                # plain split disagrees with it on exactly the numeric tokens
+                # ("100%" vs "100") that percentage constraints are made of.
+                tokens = set(_terms(self._norm_text[parent_asin]))
+                self._token_text[parent_asin] = " %s " % " ".join(sorted(tokens))
+                for token in tokens:
+                    doc_freq[token] = doc_freq.get(token, 0) + 1
                 anchor_key = normalize_text(coarse_category(product.get("categories") or []))
                 self._anchor_index.setdefault(anchor_key, []).append(parent_asin)
                 batch.append((
@@ -366,13 +369,6 @@ class Agent:
             cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
         self.connection.commit()
         self._n_docs = len(self._products)
-        # `_norm_text` is already in the shared normal form, so a plain split
-        # matches `_terms` here and keeps the one-time index build cheap.
-        doc_freq = self._doc_freq
-        for text in self._norm_text.values():
-            for token in set(text.split()):
-                if len(token) > 1 and token not in STOPWORDS:
-                    doc_freq[token] = doc_freq.get(token, 0) + 1
         self._anchor_tokens = {
             key: frozenset(_terms(key)) for key in self._anchor_index
         }
