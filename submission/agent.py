@@ -222,7 +222,18 @@ FEATURE_PARTIAL_MATCH = True
 FEATURE_PARTIAL_IDF_FLOOR = True
 FEATURE_FIELD_WEIGHT = True
 FEATURE_INFIX_ANCHOR = True
-FEATURE_FUZZY_ANCHOR = True
+# CUT on measurement. As a scoring fallback it was catastrophic (L3b 0.832112
+# -> 0.674195): the best-overlap key is the wrong set 57 times in 200, and a
+# wrong anchor bonus buries the target under a whole wrong category. Redesigned
+# to feed candidate generation only, it recovered 146 of those 158 points but
+# is still net negative where it exists to help -- isolated, L3b 0.832112 ->
+# 0.820135; in combination, removing it takes L3b 0.871357 -> 0.875537 with
+# clean and L3a unchanged to six decimals. Together with the multi-query result
+# (also candidate-adding, also ~-0.012 at L3b) the conclusion is that the pool
+# is not usefully recall-limited: extra candidates cost more in precision than
+# the recovered targets are worth. INFIX_ANCHOR gets the same 54 openings back
+# by exact lookup, with no wrong picks and no pool growth at all.
+FEATURE_FUZZY_ANCHOR = False
 FEATURE_REGIME_ESCAPE = True
 # MULTI_QUERY: retrieval fires a single FTS query built as an OR of up to 40
 #   terms, so BM25 favours documents matching many *common* terms and a

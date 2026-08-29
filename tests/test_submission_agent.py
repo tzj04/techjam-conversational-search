@@ -585,6 +585,8 @@ class FuzzyAnchorTest(unittest.TestCase):
         agent.reset("s", {})
         # "Frocks" is not a catalog category, so neither the suffix nor the
         # exact infix scan can recover it and the fuzzy path is what runs.
+        agent_module.FEATURE_FUZZY_ANCHOR = True
+        self.addCleanup(setattr, agent_module, "FEATURE_FUZZY_ANCHOR", False)
         agent.respond("s", "I'm looking for Women Frocks, but I'm still exploring.", 1, 10)
         state = agent._sessions["s"]
         self.assertIsNotNone(state.anchor)
