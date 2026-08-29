@@ -600,6 +600,8 @@ class RegimeEscapeTest(unittest.TestCase):
         """Constraints held but the leader matches none of them: the exact
         matcher has failed, so deferring to GATE_CAP_TURN only burns turns."""
         agent = build_agent()
+        agent_module.FEATURE_REGIME_ESCAPE = True
+        self.addCleanup(setattr, agent_module, "FEATURE_REGIME_ESCAPE", False)
         agent.reset("s", {})
         agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
         response = agent.respond(

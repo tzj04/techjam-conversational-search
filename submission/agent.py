@@ -234,7 +234,16 @@ FEATURE_INFIX_ANCHOR = True
 # the recovered targets are worth. INFIX_ANCHOR gets the same 54 openings back
 # by exact lookup, with no wrong picks and no pool growth at all.
 FEATURE_FUZZY_ANCHOR = False
-FEATURE_REGIME_ESCAPE = True
+# CUT on measurement. Isolated it is negative (L3a 0.887002 -> 0.884241,
+# -0.0028) for the same reason the p_buy escape was cut at -0.0027: opening
+# the gate early re-creates the lock-ins gating exists to prevent. Waiting
+# still pays under paraphrase, because the ranking keeps improving from loose
+# terms and later constraints even when no payload matches exactly. In
+# combination it is inert (+/-0.0003, opposite signs at L3a and L3b) because
+# PARTIAL_MATCH counts high-coverage partials toward the gate's `informed`
+# test -- so the correlated blindness this was built to break is already fixed
+# upstream by a feature that measures positive. Retained behind the flag.
+FEATURE_REGIME_ESCAPE = False
 # MULTI_QUERY: retrieval fires a single FTS query built as an OR of up to 40
 #   terms, so BM25 favours documents matching many *common* terms and a
 #   constraint whose vocabulary is rare can contribute no candidates at all.
