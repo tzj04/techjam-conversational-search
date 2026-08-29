@@ -6,10 +6,12 @@ Build a **slot-based constraint state machine** with a **cascading retriever** (
 
 **Measured baseline (current `starter/agent.py`, public set, 2026-08-29):** TechnicalScore **0.859**, HitRate@10 **0.975**, MRR **0.710**, MTTC **3.08**. Per scenario: buying 0.99 hit / MTTC 2.6, browsing 0.975 / 2.7, boundary 1.0 / 2.6, intent_override **0.933 / 5.3**. (Run: `python3 -m evaluator.local_evaluator` — defaults point at `data/catalog.jsonl` / `data/public_set.jsonl`. Ignore the weak_bm25 0.107 reference in `docs/baseline_results.json`.)
 
+> **Final outcome (2026-08-29, all stages complete — see `REPORT.md`):** TechnicalScore **0.962** (HitRate@10 **1.000** on every scenario, MRR **0.947**, MTTC 2.10), holding **0.962 / 0.959** under the L1/L2 paraphrase stress harness where the starter fell to 0.664/0.616. Deterministic, stdlib-only, zero tokens. Stage-by-stage outcomes are noted inline below.
+
 The three levers, in order of points available:
 
 1. **MRR 0.71 → ~0.9** (30% of score). Two causes, both measured in `results_starter.json`:
-   - **Rank lock-in:** 71 of 195 hits happen on **turn 1** at mean rank **2.8** — the session ends at first hit, freezing a mediocre rank before any constraint was revealed. The non-stopping shadow run (`tools/shadow_evaluator.py`, 2026-08-29) confirms the counterfactual directly: that same cohort's mean rank improves to **1.81 by turn 3** and **1.35 by turn 4** if the session continues, with zero sessions leaving the top-10. Main fix: exact-constraint reranking (§6 Stage 1), which lifts ranks at *every* turn; recommendation gating (§5.4) is a small measured bonus (+0.004–0.009 TechnicalScore ceiling), not a co-equal lever.
+   - **Rank lock-in:** 71 of 195 hits happen on **turn 1** at mean rank **2.8** — the session ends at first hit, freezing a mediocre rank before any constraint was revealed. The non-stopping shadow run (`tools/shadow_evaluator.py`, 2026-08-29) confirms the counterfactual directly: that same cohort's mean rank improves to **1.81 by turn 3** and **1.35 by turn 4** if the session continues, with zero sessions leaving the top-10. Main fix: exact-constraint reranking (§6 Stage 1), which lifts ranks at *every* turn; recommendation gating (§5.4) started as a small measured bonus under the starter ranking (+0.004–0.009 ceiling) and — exactly as §5.4's re-measure-then-decide procedure was designed to catch — became the **+0.066 headline feature** once the Stage 1 anchor guaranteed the target in the pool from turn 1 (outcome note in §5.4).
    - **Fuzzy matching:** the starter tokenizes revealed constraint strings, destroying the exact-substring signal (§1 fact 1).
 2. **Intent-override MTTC 5.3 → ~4** (floor ≈ 3.5, override fires turn 3–4). We currently lose ~1.8 turns re-converging. Fix: §5.5 — including the discovery that the "old" preference is still true of the target (§1 fact 10).
 3. **Protect HitRate 0.975 on the private set**, which may paraphrase customer messages — the paraphrase stress harness built early so every stage is measured under it (§6 Stage 1.5), with the BM25 → dense fallback cascade as the fix (§6 Stage 4).
@@ -160,7 +162,9 @@ Rank by target-probability, then **diversify across residual uncertainty** inste
 - For attributes we *don't* know (unfilled or "no preference"), spread slots across values (unknown color → don't return 10 black shoes). Cheap MMR-style pass: penalize a candidate sharing all unknown-attribute values with an already-picked one. Diversification strength scales with `1 − p_buy` and pool entropy.
 - Dedupe `parent_asin`, catalog-valid ids only, at most `top_k`.
 
-### 5.4 Early-turn recommendation gating (small measured bonus, not a headline lever)
+### 5.4 Early-turn recommendation gating
+
+> **Outcome (2026-08-29, Stage 3):** the decision procedure below fired in the opposite direction from its starter-era estimate — under the Stage 1/2 agent, whose category anchor puts the target in the pool from turn 1, 140/200 sessions hit on turn 1 before any constraint could rank them, and the shadow re-run (`results_shadow_stage2.json`) showed ranks plateauing at ~1 by turn 3. Shipped policy: **depth 1 until the ranked leader matches ≥ 2 active constraints and turn ≥ 3; full top-k on `drained ≥ 1`, dissatisfaction, or turn ≥ 5.** Worth **+0.0662 TechnicalScore** (0.896 → 0.962); validate-split guardrail passed (0.9642, hit-rate 1.0). The starter-era numbers below are kept as the record of why gating was *initially* demoted — both measurements are the same §5.4 procedure doing its job.
 
 Originally justified by comparing turn-1 hits (mean rank 2.8) with turn-≥3 hits (mean rank 2.0) — a confounded comparison (different session populations). Replaced with the real counterfactual: `tools/shadow_evaluator.py` re-runs every session **without stopping at the first hit** and records the target's rank in the returned top-10 at every turn (`results_shadow.json`, 2026-08-29, starter agent):
 
@@ -194,14 +198,17 @@ So gating's ceiling under the starter ranking is **under one point**. Design (im
 **Stage 1 — Exact-constraint rerank (biggest win, no new deps).**
 Capture the full `"what matters is:"` payload; split only on `"; "`; **strip the sentence-final period from the last segment** (§1 fact 11); store verbatim; build the shared normal form for constraints *and* product text (§1 fact 11: colon-flattening for details, punctuation→space, keep `$ % .` in numbers); strip the `"color: "` generated prefix; budget via permissive numeric regex anywhere in the constraint — no prefix assumption, no number → no price filter (§1 fact 12) — near-equality with range fallback; specificity-weighted scoring (long feature strings ≫ single words); dominant boost for all-constraints-matched; exact category-tail filter from turn 1 (mechanism confirmed: the starter's loose ±soft-weight terms are what drifts — §1 fact 4).
 *Accept:* public MRR ≥ 0.85, no scenario hit-rate regression, micro-tests of §8 item 3 green. *Effort:* ~1 day.
+> **DONE (2026-08-29, `results_stage1.json`):** score 0.896, **hit-rate 1.000 on all four scenarios**, MTTC 1.55, override MTTC already 3.6. MRR landed at 0.690, not 0.85 — a verified structural ceiling, not a weight problem: the anchor guarantees the target in the pool from turn 1, so 140/200 sessions hit before constraints exist to rank on (weight scaling reproduced identical metrics to six decimals). Resolved by §5.4 gating in Stage 3.
 
 **Stage 1.5 — Paraphrase stress harness (moved up from Stage 4 — measure before building the fix).**
 Wrap `initial_message`/`customer_reply` output with a paraphraser and rerun the evaluator — our own private-set proxy. Built now so Stages 2–6 all report clean **and** paraphrased numbers; every ablation row carries both for free. The LLM paraphraser writes its rewrites to a cached corpus (`data/paraphrase_cache.jsonl`) keyed by original text, so the harness replays offline — otherwise the harness itself would violate §9's no-network final verification. Include budget phrasing variants ("around fifty dollars", "my budget's about $80") and reordered constraint lists.
 *Accept:* harness replays from cache with no network; Stage 1 clean + paraphrased scores recorded. *Effort:* ~0.5 day.
+> **DONE (2026-08-29, `tools/paraphraser.py` + `tools/paraphrase_eval.py`):** starter collapses 0.859 → 0.664 (L1) / 0.616 (L2), and the damage is dominated by **frame-parsing brittleness** (the "looking for"/override/reply regexes), not loss of the constraint substring signal. This redirected Stage 2 (permissive extraction became a requirement) and pre-decided Stage 4's scope.
 
 **Stage 2 — Question policy + override recovery.**
 Always-`other` drain (§5.2, with the A/B against the old ladder as the ablation row); exhausted tracking; never brand/category; never `null` before `drained ≥ 2`; override → demoted evidence + consistency gate + immediate exact-match of new value + `stale_recs` cleared.
 *Accept:* override MTTC ≤ 4.2, overall MTTC ≤ 2.9, A/B documented. *Effort:* ~1 day.
+> **DONE (2026-08-29, `results_stage2.json`):** clean run byte-identical to Stage 1 (the generalized patterns parse the exact frames identically — robustness came free); under paraphrase the agent loses **0.24–0.38 points** where the starter lost 19.5–24.3, hit-rate 1.0 held at both levels. Override MTTC 3.6 ≤ 4.2 ✓, MTTC 1.55 ≤ 2.9 ✓. Key mechanisms: token-suffix anchor scan, payload family regex + colon-joiner heuristic, demotion asymmetry as the consistency gate, memo invalidation on override.
 
 **Stage 3 — Soft routing, priors, diversification (independently gated features).**
 The old bundle ("ship six features, accept if TechnicalScore ≥ 0.93") could not attribute a regression to a feature. Each feature now lands as its own commit with its own before/after measurement (clean + paraphrased) and its own gate:
@@ -216,19 +223,24 @@ The old bundle ("ship six features, accept if TechnicalScore ≥ 0.93") could no
 | rec gating (§5.4) | **last**, and only if the post-Stage-1 shadow re-run still shows a positive ceiling; adopt on validation split with zero hit-rate loss |
 
 *Accept:* public TechnicalScore ≥ 0.93 with the per-feature table filled in; every cut feature documented with its number. *Effort:* 1–2 days.
+> **DONE (2026-08-29, `results_stage3.json`):** score **0.962** clean / 0.962 L1 / 0.959 L2, hit-rate 1.0 everywhere, MRR 0.947. Shipped: rec gating (**+0.0662** — see §5.4 outcome note; tune 151 / validate 49, guardrail passed), stale-rec penalty and relaxation ladder as dissatisfaction-only insurance, demo guard. Cut with measured numbers: p_buy gating escape (−0.0027 — releasing full lists early re-creates lock-ins), profile-tag prior (MRR +0.0025 but net −0.00135 on score via MTTC — cut on the honest net gate, not the literal MRR gate), MMR (exactly 0 — its firing condition barely occurs; pure private-set downside). Cut code stays behind off-by-default `FEATURE_*` flags with deltas recorded.
 
 **Stage 4 — Dense retrieval (the paraphrase fix, sized by Stage 1.5's measurements).**
 Precompute embeddings offline (`sentence-transformers/all-MiniLM-L6-v2` or similar) → ship `embeddings.npy` + id list; runtime = numpy matmul only. Query = revealed constraints + slot summary. Scope it to whatever degradation Stage 1.5 actually measured — if the lexical path holds up under paraphrase, this shrinks to a thin insurance layer. Size check: submission rules set no numeric cap but say "lightweight local assets" — 38 MB float16 is defensible; fallback to int8 quantization (~19 MB) or a smaller model if organizer guidance tightens.
 *Accept:* TechnicalScore drop ≤ 3 points under the Stage 1.5 harness. *Effort:* ~1 day.
+> **SKIPPED on the measurements it was scoped by (2026-08-29):** after Stage 2's robust extraction, the L2 residual is **~0.3 points with hit-rate 1.0** — the accept criterion is already met with no dense layer at all. Honest caveat (also in `REPORT.md`): the harness shares authorship with the agent; an adversarial paraphraser that rewrote *constraint payloads semantically* (synonyms, unit changes) would evade lexical matching, and that residual risk remains unmeasured. Dense retrieval stays the documented contingency if organizer guidance signals semantic rewording.
 
 **Stage 5 — LLM extraction layer (optional, keyed).**
 Small fast model (e.g. Haiku) for slot/constraint-span extraction + intent classification + message phrasing. Strict JSON out, regex fallback on any error/timeout, honest `usage`, `USE_LLM` flag documented.
+> **SKIPPED (2026-08-29):** the deterministic extractor holds hit-rate 1.0 under both paraphrase levels, leaving the LLM layer nothing to earn. The 0-token headline is stronger than a marginal robustness layer; remains the natural extension if a private set defeats the regex families.
 
 **Stage 6 — Tuning with an overfit guard.**
 Split the public 200 into 150 tune / 50 validate (stratified by scenario). Grid/greedy-tune the few thresholds that genuinely need it on tune only; never tune on validate. **Honesty constraint on claims:** a stratified 50-session validate split holds ~7–8 intent_override and ~2–3 boundary sessions — enough for an aggregate no-regression guardrail, useless for per-scenario conclusions. So: validate is used *only* as an aggregate-score guardrail; per-scenario numbers (including the override MTTC 5.3 → ~4 claim) are reported on the full 200 with the overfit risk stated plainly in the report. Never present a validate-split per-scenario delta as evidence of generalization.
+> **DONE (2026-08-29, folded into Stage 3):** only the gating thresholds were tuned (tune 151 / validate 49, stratified every-4th); validate guardrail passed (0.9642, hit-rate 1.0, no loss); shipped config's tune-set edge over its nearest rival was one session/one turn (0.00013) — chosen for deferral headroom, noise either way.
 
 **Stage 7 — Report + demo.**
 Ablation table (score after each stage × per scenario), §2.1 concept-mapping story, cost/latency/token table (deterministic path = 0 tokens), limitations, one demo session — pick an **intent_override** session: it shows extraction, override demotion, consistency gating, re-asking, and rank-1 conversion in one transcript.
+> **DONE (2026-08-29):** `REPORT.md` at repo root (method, stage + per-feature ablations, both measurement instruments, limitations, cost/latency, reproduction) with the intent_override demo transcript from `tools/demo_session.py`; `requirements.txt` documents the stdlib-only runtime.
 
 ## 7. Standing out: the judging narrative
 
