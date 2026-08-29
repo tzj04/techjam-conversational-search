@@ -1,8 +1,13 @@
 # Conversational Search Agent — Method Report
 
-A deterministic constraint state machine that scores **0.962 TechnicalScore** on the public set
+A deterministic constraint state machine that scores **0.963479 TechnicalScore** on the public set
 with **HitRate@10 = 1.000 on every scenario**, zero LLM calls, zero tokens, and a stdlib-only
 runtime. Entry point: `from submission.agent import Agent`.
+
+The public score is close to saturated (§6.5: a practical ceiling of ~0.9785, with hit-rate
+exhausted and MTTC at its policy floor), so most of the work went where the measured headroom was
+~9× larger — robustness under semantic paraphrase, where the agent moves from 0.887 to **0.937**
+with hit-rate 0.963 → **0.992** (§4.1).
 
 Two reference points, because they are often conflated: the organizer's shipped weak BM25 starter
 scores **0.10671** (`docs/baseline_results.json`, reproduced exactly). Our own strengthened BM25
@@ -16,16 +21,20 @@ The evaluator builds each session's hidden intent card from the target product's
 every revealed constraint is a verbatim substring of the target's catalog text, and the opening
 message carries the target's exact category tail. The agent is built around those two facts:
 
-- **Shared normal form + exact-substring matching.** One normalization (lowercase; punctuation runs
+- **Shared normal form + graded lexical matching.** One normalization (lowercase; punctuation runs
   → single space; `$ % .` preserved only inside numbers) applied identically to product text and
-  constraints, then plain substring matching. Handles the evaluator's `"key: value"` detail
-  flattening, tail-side 180-char truncation, and the sentence-final period on the last constraint
-  of every reply.
+  constraints, then substring matching. Handles the evaluator's `"key: value"` detail flattening,
+  tail-side 180-char truncation, and the sentence-final period on the last constraint of every
+  reply. A payload that does *not* match as a substring falls back to IDF-weighted token coverage
+  rather than scoring zero (§4.1) — sub-additive, so a full match always dominates and the clean-set
+  ordering is untouched.
 - **Category-anchor retrieval.** Each product's coarse category (the evaluator's own construction)
-  is precomputed; the opening message is resolved to an anchor set by a token-*suffix* scan, so any
-  rewording of the lead-in verb still lands ("Help me track down {cat}" → same anchor). On the
-  public evaluator the target is guaranteed inside the anchor set from turn 1. Applied as a
-  dominant boost, never a hard filter; BM25 + loose-term retrieval remain as fallback.
+  is precomputed; the opening message is resolved to an anchor set by a token-suffix scan, so any
+  rewording of the lead-in verb still lands ("Help me track down {cat}" → same anchor), and by an
+  exact *infix* scan when the frame appends words after the category ("I'm shopping for {cat} but
+  haven't settled on anything") — 54 of 200 openings under L3a, which the suffix scan alone drops
+  (§4.1). On the public evaluator the target is guaranteed inside the anchor set from turn 1.
+  Applied as a dominant boost, never a hard filter; BM25 + loose-term retrieval remain as fallback.
 - **Specificity-weighted rerank.** Constraint weight grows with token count (a 120-char feature
   string dominates; a bare material word is a whisper); all-constraints-matched bonus; budget
   constraints are never substring-matched — a permissive numeric regex extracts the amount and
@@ -57,7 +66,8 @@ Public set, 200 sessions. Score = 0.5·HitRate@10 + 0.3·MRR + 0.2·efficiency.
 | strengthened BM25 reference (`starter/agent.py`) | 0.858944 | 0.975 | 0.709812 | 3.075 |
 | Stage 1: exact-constraint rerank + anchor | 0.895986 | 1.000 | 0.689954 | 1.55 |
 | Stage 2: policy + override + robust extraction | 0.895986 | 1.000 | 0.689954 | 1.55 |
-| **Stage 3: + recommendation gating (final)** | **0.962179** | **1.000** | **0.946929** | 2.095 |
+| Stage 3: + recommendation gating | 0.962179 | 1.000 | 0.946929 | 2.095 |
+| **Stage 4: + graded matching, infix anchor, field weight (final)** | **0.963479** | **1.000** | **0.950340** | **2.080** |
 
 Stage 1's MRR *drop* is the diagnosis, not a regression: the anchor guarantees the target is in the
 pool from turn 1, so 140/200 sessions hit immediately at popularity-order ranks before any
@@ -68,10 +78,14 @@ Final per-scenario:
 
 | Scenario | n | HitRate@10 | MRR | MTTC |
 |---|---|---|---|---|
-| buying | 80 | 1.000 | 0.953869 | 1.63 |
-| browsing | 80 | 1.000 | 0.947917 | 1.89 |
-| boundary | 10 | 1.000 | 0.860 | 2.60 |
-| intent_override | 30 | 1.000 | 0.954762 | 3.73 (baseline 5.3) |
+| buying | 80 | 1.000 | 0.962202 | 1.600 |
+| browsing | 80 | 1.000 | 0.947917 | 1.875 |
+| boundary | 10 | 1.000 | 0.860000 | 2.600 |
+| intent_override | 30 | 1.000 | 0.954762 | 3.733 |
+
+Boundary and intent_override MTTC are at their construction floors, not merely near them: the
+boundary one-off consumes turn 2, and the evaluator blocks conversion until the override fires on
+turn 3 or 4 (floor 3.667). See §6.5.
 
 Under the paraphrase stress harness (§3):
 
@@ -79,7 +93,11 @@ Under the paraphrase stress harness (§3):
 |---|---|---|---|
 | strengthened BM25 reference | 0.858944 | 0.663890 (hit 0.775) | 0.616357 (hit 0.710) |
 | Stage 2 | 0.895986 | 0.893538 (hit 1.000) | 0.892211 (hit 1.000) |
-| **Stage 3 (final)** | **0.962179** | **0.961979 (hit 1.000)** | **0.959033 (hit 1.000)** |
+| Stage 3 | 0.962179 | 0.961979 (hit 1.000) | 0.959033 (hit 1.000) |
+| **Stage 4 (final)** | **0.963479** | **0.962529 (hit 1.000)** | **0.962479 (hit 1.000)** |
+
+L1/L2 are near-flat for both, which is the point of §3: they do not test payload matching. The
+separation appears only under L3 (§4.1).
 
 ## 3. Measurement instruments (first-class contributions)
 
@@ -254,7 +272,7 @@ cost is paid once at construction and does not touch the turn budget.
    | | clean | L3a (payloads rewritten) | L3b (category tail too) |
    |---|---|---|---|
    | Stage 3 | 0.962179 (hit 1.000) | 0.887002 (hit 0.963) | 0.832112 (hit 0.925) |
-   | Stage 4 | 0.963479 (hit 1.000) | **0.940572 (hit 0.993)** | **0.871357 (hit 0.935)** |
+   | Stage 4 | 0.963479 (hit 1.000) | **0.937284 (hit 0.992)** | **0.869344 (hit 0.933)** |
 
    The named mechanism is that `constraint.norm in text` is all-or-nothing, so a payload reworded
    anywhere scores exactly as badly as an unrelated product; the constraint then subtracts
@@ -304,7 +322,9 @@ Python 3.12 tested; no third-party packages required (`requirements.txt`). Every
 ```bash
 python3 -m unittest discover -s tests                                  # 53 tests
 python3 -m tools.run_eval --agent submission --output results.json     # full evaluation
-python3 -m tools.paraphrase_eval --agent submission.agent --level L2   # stress harness
+python3 -m tools.paraphrase_eval --agent submission.agent --level L2   # frame stress
+python3 -m tools.l3_eval --agent submission.agent --level L3a --seeds 0,1,2   # semantic stress
+python3 -m tools.l3_eval --agent submission.agent --level L3a --ablate anchor # role-swap ablation
 python3 -m tools.shadow_evaluator --agent submission.agent             # rank-vs-turn curves
 python3 -m tools.demo_session --sample-id public_0003                  # the transcript below
 ```
