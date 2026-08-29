@@ -28,6 +28,7 @@ def build_agent(module_path: str, catalog: str, ablate: str | None):
         # candidate generation too (agent.py `_build_pool`), not just from the
         # score. Zeroing ANCHOR_BONUS alone under-ablates.
         agent._anchor_index = {}
+        agent._anchor_tokens = {}   # also removes it from the fuzzy fallback
     elif ablate == "gating":
         agent_module = importlib.import_module(module_path)
         agent_module.FEATURE_GATING = False

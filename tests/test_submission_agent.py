@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import submission.agent as agent_module
 from submission.agent import (
     ALLOWED_ATTRIBUTES,
     Agent,
@@ -478,3 +479,105 @@ class SoftRoutingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BudgetMisroutingGuardTest(unittest.TestCase):
+    """A money *word* inside a long features string is not a budget disclosure.
+    Before the guard it was routed to the price path, its text discarded and a
+    bogus filter applied from whatever digit appeared first."""
+
+    LONG = (
+        "WELL PRICED, TIMELESS STYLE - Traditional in its design, this "
+        "inexpensive but very durable 100% Cotton shirt is built to last"
+    )
+
+    def test_long_priced_string_stays_lexical(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        agent.respond("s", f"For that, what matters is: {self.LONG}.", 2, 10)
+        state = agent._sessions["s"]
+        self.assertIsNone(state.budget_point)
+        self.assertEqual(len(state.constraints), 1)
+        self.assertFalse(state.constraints[0].is_budget)
+        self.assertIn("cotton", state.constraints[0].norm)
+
+    def test_real_budget_disclosures_still_route_to_price(self):
+        for phrase in (
+            "budget around $79.99",
+            "my budget's about 79.99 dollars",
+            "somewhere around $79.99 works for me",
+            "I can spend around $79.99",
+        ):
+            with self.subTest(phrase=phrase):
+                agent = build_agent()
+                agent.reset("s", {})
+                agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+                agent.respond("s", f"For that, what matters is: {phrase}.", 2, 10)
+                self.assertEqual(agent._sessions["s"].budget_point, 79.99)
+
+
+class PartialMatchTest(unittest.TestCase):
+    def test_coverage_is_one_for_identical_and_zero_for_disjoint(self):
+        agent = build_agent()
+        text = agent._token_text["A001"]
+        self.assertAlmostEqual(agent._coverage("100% cotton", text), 1.0)
+        self.assertEqual(agent._coverage("zzzz qqqq", text), 0.0)
+        # A reworded payload keeps partial credit rather than scoring zero.
+        boot = agent._token_text["A002"]
+        self.assertGreater(agent._coverage("soles made of rubber", boot), 0.0)
+
+    def test_reworded_payload_still_ranks_the_right_product(self):
+        """'Rubber sole' -> 'soles made of Rubber' is a total loss under the
+        whole-string substring test; graded coverage keeps the signal."""
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Men Boots.", 1, 10)
+        response = agent.respond("s", "What matters to me is: soles made of Rubber.", 2, 10)
+        agent._sessions["s"].drained = 1  # force full-width output
+        response = agent.respond("s", "I don't have an additional preference for other.", 3, 10)
+        self.assertEqual(response["recommendations"][0]["parent_asin"], "A002")
+
+    def test_full_substring_match_outscores_any_partial(self):
+        agent = build_agent()
+        weight = 3.0
+        best_partial = weight * agent_module.PARTIAL_SCALE * 1.0 * 1.0
+        self.assertLess(best_partial, weight)
+
+
+class FuzzyAnchorTest(unittest.TestCase):
+    def test_exact_category_takes_the_full_bonus(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        state = agent._sessions["s"]
+        self.assertEqual(state.anchor_bonus, agent_module.ANCHOR_BONUS)
+        self.assertIn("A001", state.anchor_set)
+
+    def test_reworded_category_degrades_instead_of_vanishing(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses items, but I'm still exploring.", 1, 10)
+        state = agent._sessions["s"]
+        self.assertIsNotNone(state.anchor)
+        self.assertEqual(state.anchor_bonus, agent_module.FUZZY_ANCHOR_BONUS)
+
+
+class RegimeEscapeTest(unittest.TestCase):
+    def test_gate_opens_when_nothing_matches(self):
+        """Constraints held but the leader matches none of them: the exact
+        matcher has failed, so deferring to GATE_CAP_TURN only burns turns."""
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        response = agent.respond(
+            "s", "What matters to me is: qqqqzzz wwwwvvv; xxxxyyy uuuuttt.", 2, 10
+        )
+        self.assertGreater(len(response["recommendations"]), 1)
+
+    def test_gate_still_defers_when_matching_works(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        response = agent.respond("s", "What matters to me is: 100% Cotton; Machine wash, cold.", 2, 10)
+        self.assertEqual(len(response["recommendations"]), agent_module.GATE_DEPTH)
