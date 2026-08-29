@@ -179,15 +179,70 @@ into pure hit-rate risk. The gate cannot tell, because its own `informed` test c
 matches and so fails in the same correlated way the reranker does — which is what `REGIME_ESCAPE`
 (§4.1) exists to break.
 
+### 4.1 Stage 4: graded decisions under paraphrase
+
+L3 (§3) showed the Stage 3 agent's robustness rests on decisions that are *binary* and so discard
+information the moment the exact path fails. Four changes replace each with a graded one. Every one
+is reachable only where the current path already failed, so each is clean-neutral **by
+construction** — confirmed to six decimals, which is the property to check first:
+
+| feature | mechanism it replaces | clean | L3a | L3b |
+|---|---|---|---|---|
+| **partial match** + IDF floor | `constraint.norm in text` is all-or-nothing, so a payload reworded *anywhere* scores exactly as badly as an unrelated product. Falls back to IDF-weighted token coverage, sub-additive so a full match always dominates; partial evidence must also clear one token at 5% catalog document frequency, or matching `made`/`of` alone would score 0.5 | 0 | **+0.0329** | **+0.0250** |
+| **infix anchor** | the anchor scan read the category as a token *suffix* of a clause, so any frame appending words after it lost the anchor though the category is present byte-identical. **54 of 200 L3a openings.** An exact scan over contiguous token windows recovers 54/54 with 0 wrong picks | 0 | **+0.0263** | **+0.0347** |
+| **field weight** | `intent_card` draws candidates from `features`+`details` only, so a match there is stronger evidence than the same string in a long `description`. Proportional to constraint weight, so override demotion scales it | **+0.0013** | +0.0009 | +0.0023 |
+| **budget guard** | a money *word* routed a segment to the price path, discarding its text and filtering on whatever digit came first. 479 catalog card-candidate segments trip it; the guard requires a price *statement* (≤64 chars, number-adjacent) and never drops text it declines to route. False routes 479 → 46 | 0 | 0 | 0 |
+
+Deltas are measured in combination (`ALL minus X`); the two main levers are superadditive — infix
+puts the right candidates in the pool, partial matching then ranks them — so their isolated figures
+(+0.0222 and +0.0220 at L3a) understate them.
+
+Shipped configuration against Stage 3, three seeds at L3:
+
+| severity | Stage 3 | Stage 4 |
+|---|---|---|
+| clean | 0.962179 (hit 1.000) | **0.963479** (hit 1.000) |
+| L1 | 0.961979 | 0.962529 |
+| L2 | 0.959033 | 0.962479 |
+| L3a | 0.887002 (hit 0.963) | **0.937284 (hit 0.992)** |
+| L3b | 0.832112 (hit 0.925) | **0.869344 (hit 0.933)** |
+| L3b + singles mutated | 0.803636 (hit 0.903) | 0.828317 (hit 0.900) |
+
+Seed variance at L3a also tightens (±0.0147 → ±0.0041). **The gains shrink monotonically with
+severity** (+0.050, +0.037, +0.025), and at the harshest level hit-rate does not improve
+(0.903 → 0.900, inside a ±0.018 seed band). Stage 4 buys a large margin against moderate paraphrase
+and a shrinking one against severe paraphrase; it does not make the agent paraphrase-proof.
+
+### 4.2 Cut on measurement
+
+| feature | measured | verdict |
+|---|---|---|
+| fuzzy anchor (scoring fallback) | L3b 0.832112 → **0.674195** | cut — the best-overlap key is the *wrong* set 57 times in 200, and a wrong anchor bonus buries the target under a whole wrong category |
+| fuzzy anchor (recall-only redesign) | L3b −0.0120 isolated; removing it from the bundle **+0.0042** | cut — the redesign recovered 146 of those 158 points and is still net negative where it exists to help |
+| multi-query retrieval | L3b 0.871357 → 0.858485; clean and L3a unchanged | cut — 5 of 12 L3b misses *are* genuine recall failures, but the extra candidates cost more in precision than the recovered targets return |
+| regime escape (open the gate when nothing matches) | L3a **−0.0028** isolated; ±0.0003 in combination | cut — mirrors the p_buy escape's −0.0027. Waiting still pays under paraphrase; and once partial matching counts high-coverage partials toward the gate's `informed` test, the blindness this addressed is fixed upstream |
+
+Two of these are one finding: **the pool is not usefully recall-limited.** Fuzzy anchoring and
+multi-query retrieval are different mechanisms that both work by admitting more candidates, and both
+cost ≈0.012 at L3b. Infix anchoring recovers the same class of failure by exact lookup — no wrong
+picks, no pool growth — and gains +0.026/+0.035. The pattern across all seven attempts: every change
+that *removed an unnecessary restriction* worked; every change that *added capability* did not.
+
 ## 5. Cost, latency, tokens
 
 | Metric | Value |
 |---|---|
 | LLM calls / tokens / API cost | 0 / 0 / $0 |
-| One-time index build (50k products) | 4.1 s |
-| Full 200-session evaluation | 8.7 s |
-| Per session / per turn | 44 ms / 21 ms |
+| One-time index build (50k products) | 4.1 s → **8.5 s** (Stage 4) |
+| Full 200-session evaluation | 8.7 s → **9.4 s** |
+| Per session / per turn | 44 / 21 ms → **47 / 23 ms** |
 | Runtime dependencies | Python 3 stdlib only |
+
+Stage 4 roughly **doubles the one-time index build** (measured same-machine: 7.56 s → 15.71 s, then
+scaled to the 4.1 s reference above) for the document-frequency table and two extra per-product
+texts. Per-turn cost rises only **8%** (37.4 → 40.6 ms same-machine), since the added work is
+memoized per session and the infix scan is ~120 dict lookups on the opening turn only. The build
+cost is paid once at construction and does not touch the turn budget.
 
 ## 6. Limitations
 
