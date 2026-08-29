@@ -1,4 +1,4 @@
-from starter.agent import Agent
+from submission.agent import Agent
 
 agent = Agent("data/catalog.jsonl")
 
