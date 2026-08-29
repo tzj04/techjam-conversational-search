@@ -178,7 +178,7 @@ anchor outright. Under paraphrase, substring matching degrades and the anchor be
 carrier, **2.8× more load-bearing than on clean**. That role swap is the defence-in-depth the design
 argues for, stated as a number rather than asserted.
 
-### Gating's value is a slope, not a floor
+### Gating's value decays with paraphrase severity, then holds
 
 Recommendation gating is the single largest lever and the feature the submission rests on, so its
 behaviour under divergence matters more than its clean delta:
@@ -189,13 +189,21 @@ behaviour under divergence matters more than its clean delta:
 | L1 | 0.961979 | 0.893538 | +0.068441 |
 | L2 | 0.959033 | 0.892211 | +0.066822 |
 | L3a | 0.887002 (hit 0.963) | 0.852811 (hit 0.970) | **+0.034191** |
+| L3b | 0.832112 (hit 0.925) | 0.801444 (hit 0.933) | +0.030668 |
+| L3b + singles mutated | 0.803636 (hit 0.903) | 0.774261 (hit 0.915) | +0.029375 |
 
-Flat through L1 and L2 — neither touches payloads — then halving at L3a. The mechanism is visible
-in the hit-rate column: **removing gating raises hit-rate under paraphrase** (0.963 → 0.970).
-Gating buys rank by spending turns; when the ranking never becomes informed, that spend converts
-into pure hit-rate risk. The gate cannot tell, because its own `informed` test counts *exact*
-matches and so fails in the same correlated way the reranker does — which is what `REGIME_ESCAPE`
-(§4.1) exists to break.
+Flat through L1 and L2 — neither touches payloads — then halving at L3a and **holding near +0.030
+across the three harshest levels**. It decays and flattens rather than crossing zero, so the
+largest lever in the submission carries no measured negative-transfer risk down to a severity where
+the agent has already lost 16 points.
+
+The residual risk is narrower than that, and visible in the hit-rate column: **removing gating
+raises hit-rate at every degraded level** (0.963/0.970, 0.925/0.933, 0.903/0.915). Gating buys rank
+by spending turns; when the ranking becomes informed more slowly, that spend partly converts into
+hit-rate risk, and gating stays net-positive purely on MRR. Since hit is 50% of the score and the
+only irrecoverable loss, that trade — not the headline delta — is the thing to watch on a private
+set. Attempting to break the gate's conservatism made it worse: see `REGIME_ESCAPE` in §4.2, which
+mirrors the p_buy escape's −0.0027 almost exactly.
 
 ### 4.1 Stage 4: graded decisions under paraphrase
 
@@ -237,7 +245,7 @@ and a shrinking one against severe paraphrase; it does not make the agent paraph
 |---|---|---|
 | fuzzy anchor (scoring fallback) | L3b 0.832112 → **0.674195** | cut — the best-overlap key is the *wrong* set 57 times in 200, and a wrong anchor bonus buries the target under a whole wrong category |
 | fuzzy anchor (recall-only redesign) | L3b −0.0120 isolated; removing it from the bundle **+0.0042** | cut — the redesign recovered 146 of those 158 points and is still net negative where it exists to help |
-| multi-query retrieval | L3b 0.871357 → 0.858485; clean and L3a unchanged | cut — 5 of 12 L3b misses *are* genuine recall failures, but the extra candidates cost more in precision than the recovered targets return |
+| multi-query retrieval | L3b **−0.0129**, clean and L3a unchanged to six decimals (measured before the two cuts below, so both arms sat at 0.871357 / 0.858485) | cut — 5 of 12 L3b misses *are* genuine recall failures, but the extra candidates cost more in precision than the recovered targets return |
 | regime escape (open the gate when nothing matches) | L3a **−0.0028** isolated; ±0.0003 in combination | cut — mirrors the p_buy escape's −0.0027. Waiting still pays under paraphrase; and once partial matching counts high-coverage partials toward the gate's `informed` test, the blindness this addressed is fixed upstream |
 
 Two of these are one finding: **the pool is not usefully recall-limited.** Fuzzy anchoring and
