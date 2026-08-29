@@ -1,8 +1,14 @@
 # Conversational Search Agent — Method Report
 
 A deterministic constraint state machine that scores **0.962 TechnicalScore** on the public set
-(baseline starter: 0.859) with **HitRate@10 = 1.000 on every scenario**, zero LLM calls, zero
-tokens, and a stdlib-only runtime (~21 ms per turn). Entry point: `from submission.agent import Agent`.
+with **HitRate@10 = 1.000 on every scenario**, zero LLM calls, zero tokens, and a stdlib-only
+runtime. Entry point: `from submission.agent import Agent`.
+
+Two reference points, because they are often conflated: the organizer's shipped weak BM25 starter
+scores **0.10671** (`docs/baseline_results.json`, reproduced exactly). Our own strengthened BM25
+reference — `starter/agent.py`, which the challenge explicitly invites participants to edit, and
+which is *not* the organizer's baseline — scores **0.858944**. Comparisons in this report are
+against the strengthened reference, which is the harder of the two.
 
 ## 1. Method
 
@@ -47,7 +53,8 @@ Public set, 200 sessions. Score = 0.5·HitRate@10 + 0.3·MRR + 0.2·efficiency.
 
 | Configuration | TechnicalScore | HitRate@10 | MRR | MTTC |
 |---|---|---|---|---|
-| starter baseline | 0.858944 | 0.975 | 0.709812 | 3.075 |
+| organizer weak BM25 starter (`docs/baseline_results.json`) | 0.106710 | 0.125 | 0.068034 | 9.81 |
+| strengthened BM25 reference (`starter/agent.py`) | 0.858944 | 0.975 | 0.709812 | 3.075 |
 | Stage 1: exact-constraint rerank + anchor | 0.895986 | 1.000 | 0.689954 | 1.55 |
 | Stage 2: policy + override + robust extraction | 0.895986 | 1.000 | 0.689954 | 1.55 |
 | **Stage 3: + recommendation gating (final)** | **0.962179** | **1.000** | **0.946929** | 2.095 |
@@ -70,7 +77,7 @@ Under the paraphrase stress harness (§3):
 
 | Configuration | clean | L1 (frames reworded) | L2 (payloads mutated) |
 |---|---|---|---|
-| starter | 0.858944 | 0.663890 (hit 0.775) | 0.616357 (hit 0.710) |
+| strengthened BM25 reference | 0.858944 | 0.663890 (hit 0.775) | 0.616357 (hit 0.710) |
 | Stage 2 | 0.895986 | 0.893538 (hit 1.000) | 0.892211 (hit 1.000) |
 | **Stage 3 (final)** | **0.962179** | **0.961979 (hit 1.000)** | **0.959033 (hit 1.000)** |
 
@@ -78,7 +85,7 @@ Under the paraphrase stress harness (§3):
 
 **Non-stopping shadow evaluator** (`tools/shadow_evaluator.py`): replays every session without
 stopping at the first hit, recording the target's rank at every turn — the true counterfactual
-behind any "defer recommendations" idea. It first *demoted* gating (under the starter's reranker
+behind any "defer recommendations" idea. It first *demoted* gating (under the BM25 reference's reranker
 the oracle ceiling was +0.004–0.009, mostly eaten by turn cost), then *justified* it after Stage 1
 (ranks plateau at ~1 by turn 3 under the anchor reranker; uniform defer-to-turn-2 alone worth
 +0.039). Same instrument, opposite verdicts, both correct — the decision procedure working as
@@ -88,7 +95,7 @@ designed.
 customer message rewritten by a deterministic seeded paraphraser. L1 rewrites sentence frames but
 keeps constraint payloads byte-identical; L2 additionally mutates payloads (joiner replacement,
 case flips, budget rephrasing, reordering). An offline cache hook (`data/paraphrase_cache.jsonl`)
-allows LLM-generated rewrites to be replayed with no network. The starter loses 19.5–24.3 points
+allows LLM-generated rewrites to be replayed with no network. The BM25 reference loses 19.5–24.3 points
 under it; the final agent loses 0.02–0.31.
 
 ## 4. Ablations and cut features
