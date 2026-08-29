@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import statistics
 from pathlib import Path
@@ -27,7 +28,6 @@ from evaluator.local_evaluator import (
     materialize_hidden_fields,
     normalize_recommendations,
 )
-from starter.agent import Agent
 
 
 def shadow_evaluate(agent, samples, catalog_ids, categories, products) -> list[dict]:
@@ -131,13 +131,15 @@ def analyze(sessions: list[dict]) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Non-stopping shadow evaluator (rank-vs-turn curves)")
+    parser.add_argument("--agent", default="starter.agent", help="module path exporting Agent")
     parser.add_argument("--catalog", default="data/catalog.jsonl")
     parser.add_argument("--dataset", default="data/public_set.jsonl")
     parser.add_argument("--output", default="results_shadow.json")
     args = parser.parse_args()
+    agent_cls = importlib.import_module(args.agent).Agent
     samples = load_jsonl(args.dataset)
     catalog_ids, categories, products = catalog_index(args.catalog)
-    sessions = shadow_evaluate(Agent(args.catalog), samples, catalog_ids, categories, products)
+    sessions = shadow_evaluate(agent_cls(args.catalog), samples, catalog_ids, categories, products)
     summary = analyze(sessions)
     Path(args.output).write_text(
         json.dumps({"summary": summary, "sessions": sessions}, indent=2) + "\n", encoding="utf-8"
