@@ -229,7 +229,10 @@ PARTIAL_MIN = 0.34
 # score. (On the 50k catalog this evaluates to 2.996.)
 PARTIAL_IDF_QUANTILE = 0.05
 PARTIAL_COUNTS_AS_MATCH = 0.80   # coverage at which a partial counts for gating
-FIELD_WEIGHT_BONUS = 0.45        # per constraint matched inside features/details
+# Proportional, not flat: a flat bonus would hand demoted (0.1x) override
+# evidence its full value and break the §5.5 consistency asymmetry, and it
+# would reward a bare material word as much as a 120-char feature string.
+FIELD_WEIGHT_RATIO = 0.25        # of the constraint's own weight
 FUZZY_ANCHOR_MIN = 0.5           # min token overlap to accept a fuzzy key
 FUZZY_ANCHOR_KEYS = 3            # keys unioned into the pool (recall only)
 
@@ -844,7 +847,7 @@ class Agent:
                         # asymmetry is the §5.5 consistency gate.
                         entry[1] += constraint.weight
                         if FEATURE_FIELD_WEIGHT and constraint.norm in card_text:
-                            entry[1] += FIELD_WEIGHT_BONUS
+                            entry[1] += constraint.weight * FIELD_WEIGHT_RATIO
                         if not constraint.demoted:
                             entry[2] += 1
                         continue

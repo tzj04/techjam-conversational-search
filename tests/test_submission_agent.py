@@ -609,3 +609,19 @@ class RegimeEscapeTest(unittest.TestCase):
         agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
         response = agent.respond("s", "What matters to me is: 100% Cotton; Machine wash, cold.", 2, 10)
         self.assertEqual(len(response["recommendations"]), agent_module.GATE_DEPTH)
+
+
+class FieldWeightTest(unittest.TestCase):
+    def test_field_bonus_respects_the_demotion_asymmetry(self):
+        """Demoted override evidence is kept at 0.1x weight. A flat field bonus
+        would hand it back full strength; a proportional one scales with it."""
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses. Machine wash, cold", 1, 10)
+        state = agent._sessions["s"]
+        live = [c for c in state.constraints if not c.is_budget][0]
+        full = live.weight * agent_module.FIELD_WEIGHT_RATIO
+        agent.respond("s", "Actually, ignore my earlier preference. What I need is: 100% Cotton.", 2, 10)
+        demoted = [c for c in state.constraints if c.norm == live.norm][0]
+        self.assertTrue(demoted.demoted)
+        self.assertAlmostEqual(demoted.weight * agent_module.FIELD_WEIGHT_RATIO, full * 0.1)
