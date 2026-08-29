@@ -212,6 +212,7 @@ FEATURE_RELAXATION = True
 #   opens the gate.
 FEATURE_BUDGET_GUARD = True
 FEATURE_PARTIAL_MATCH = True
+FEATURE_PARTIAL_IDF_FLOOR = True
 FEATURE_FIELD_WEIGHT = True
 FEATURE_FUZZY_ANCHOR = True
 FEATURE_REGIME_ESCAPE = True
@@ -220,6 +221,13 @@ FEATURE_REGIME_ESCAPE = True
 # dominates any partial one; below PARTIAL_MIN coverage nothing is awarded.
 PARTIAL_SCALE = 0.55
 PARTIAL_MIN = 0.34
+# Coverage is a *ratio*, so matching one of two common words ("made", "of")
+# scores 0.5 while carrying no information. Partial evidence must also be
+# discriminative in absolute terms: the matched tokens must carry at least the
+# information of one token appearing in `PARTIAL_IDF_QUANTILE` of the catalog.
+# Stated as a rule about the catalog and evaluated against it, not fitted to a
+# score. (On the 50k catalog this evaluates to 2.996.)
+PARTIAL_IDF_QUANTILE = 0.05
 PARTIAL_COUNTS_AS_MATCH = 0.80   # coverage at which a partial counts for gating
 FIELD_WEIGHT_BONUS = 0.45        # per constraint matched inside features/details
 FUZZY_ANCHOR_MIN = 0.5           # min token overlap to accept a fuzzy key
@@ -333,6 +341,14 @@ class Agent:
             ),
         )
 
+    @property
+    def _partial_min_idf(self) -> float:
+        """IDF of a token at `PARTIAL_IDF_QUANTILE` document frequency in *this*
+        catalog. Scales with catalog size instead of assuming 50k."""
+        return math.log(
+            (self._n_docs + 1.0) / (PARTIAL_IDF_QUANTILE * self._n_docs + 1.0)
+        )
+
     def _idf(self, token: str) -> float:
         """Smoothed inverse document frequency over the frozen catalog."""
         return math.log((self._n_docs + 1.0) / (self._doc_freq.get(token, 0) + 1.0))
@@ -352,6 +368,8 @@ class Agent:
             total += weight
             if f" {token} " in token_text:
                 hit += weight
+        if FEATURE_PARTIAL_IDF_FLOOR and hit < self._partial_min_idf:
+            return 0.0
         return hit / total if total else 0.0
 
     # -------------------------------------------------------------- interface

@@ -520,12 +520,36 @@ class BudgetMisroutingGuardTest(unittest.TestCase):
 class PartialMatchTest(unittest.TestCase):
     def test_coverage_is_one_for_identical_and_zero_for_disjoint(self):
         agent = build_agent()
-        text = agent._token_text["A001"]
-        self.assertAlmostEqual(agent._coverage("100% cotton", text), 1.0)
-        self.assertEqual(agent._coverage("zzzz qqqq", text), 0.0)
-        # A reworded payload keeps partial credit rather than scoring zero.
-        boot = agent._token_text["A002"]
-        self.assertGreater(agent._coverage("soles made of rubber", boot), 0.0)
+        agent_module.FEATURE_PARTIAL_IDF_FLOOR = False
+        try:
+            text = agent._token_text["A001"]
+            self.assertAlmostEqual(agent._coverage("100% cotton", text), 1.0)
+            self.assertEqual(agent._coverage("zzzz qqqq", text), 0.0)
+            # A reworded payload keeps partial credit rather than scoring zero.
+            boot = agent._token_text["A002"]
+            self.assertGreater(agent._coverage("soles made of rubber", boot), 0.0)
+        finally:
+            agent_module.FEATURE_PARTIAL_IDF_FLOOR = True
+
+    def test_idf_floor_scales_with_the_catalog(self):
+        """The floor is 'one token at 5% document frequency', evaluated against
+        whatever catalog is loaded — not a constant that assumes 50k rows."""
+        agent = build_agent()
+        self.assertEqual(agent._n_docs, len(MINI_CATALOG))
+        expected = __import__("math").log(
+            (agent._n_docs + 1.0)
+            / (agent_module.PARTIAL_IDF_QUANTILE * agent._n_docs + 1.0)
+        )
+        self.assertAlmostEqual(agent._partial_min_idf, expected)
+
+    def test_idf_floor_suppresses_uninformative_partial_evidence(self):
+        """Matching only common words must score zero, not a high ratio."""
+        agent = build_agent()
+        agent._n_docs = 50000
+        agent._doc_freq = {"made": 40000, "of": 45000, "unobtanium": 1}
+        text = " made of "
+        self.assertEqual(agent._coverage("made of", text), 0.0)
+        self.assertGreater(agent._coverage("unobtanium", " unobtanium "), 0.0)
 
     def test_reworded_payload_still_ranks_the_right_product(self):
         """'Rubber sole' -> 'soles made of Rubber' is a total loss under the
