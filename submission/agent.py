@@ -1,6 +1,7 @@
 """Submission agent: exact-constraint reranking over a category anchor
-(Stage 1), plus question policy, override recovery, and paraphrase-robust
-extraction (Stage 2).
+(Stage 1), question policy, override recovery, and paraphrase-robust
+extraction (Stage 2), soft intent routing with recommendation gating,
+priors, and failure recovery (Stage 3).
 
 Core ideas (see plan.md):
 - Revealed constraints are verbatim substrings of the target's catalog text
@@ -143,7 +144,11 @@ class SessionState:
     budget_point: float | None = None
     drained: int = 0                              # consecutive "no additional preference"
     exhausted: set[str] = field(default_factory=set)  # boundary one-off attributes (bookkeeping)
-    stale_shown: set[str] = field(default_factory=set)  # shown asins; penalty wiring is Stage 3
+    stale_shown: set[str] = field(default_factory=set)  # asins returned so far this session
+    penalized: frozenset[str] = frozenset()       # stale snapshot; only on dissatisfaction (§5.5)
+    dissatisfied: bool = False
+    p_buy: float = 0.5                            # soft intent confidence (§5.1)
+    profile_tags: tuple[str, ...] = ()
     memo: dict[str, list] = field(default_factory=dict)  # asin -> [n_processed, score, n_matched]
     cache_version: tuple | None = None
     cache_ranking: list[str] = field(default_factory=list)
@@ -157,6 +162,32 @@ BUDGET_EXACT_BONUS = 6.0
 BUDGET_RANGE_BONUS = 1.2
 BUDGET_MISS_PENALTY = 1.5
 BUDGET_NO_PRICE_PENALTY = 0.5
+
+# Stage 3 feature flags. Shipped set per the measured ablation (public 200,
+# clean): gating +0.0662; p_buy gating escape −0.0027 (cut); profile prior
+# −0.00135 net despite +0.0025 MRR (cut); MMR exactly 0 and pure private-set
+# downside risk (cut); stale penalty & relaxation fire only on dissatisfaction,
+# zero-cost on clean, kept as failure insurance. Code for cut features is
+# retained behind the flags for the ablation record.
+FEATURE_GATING = True
+FEATURE_PBUY = False
+FEATURE_PROFILE_PRIOR = False
+FEATURE_MMR = False
+FEATURE_STALE_PENALTY = True
+FEATURE_RELAXATION = True
+
+# Recommendation gating (§5.4), sized from results_shadow_stage2.json: ranks
+# plateau by turn 3 (rank ~1.05–1.15) and nothing leaves the top-10, so a
+# rank-2+ turn-1 hit is a pure loss vs deferring. Depth 1 keeps genuine
+# rank-1 hits (optimal) while blocking lock-ins.
+GATE_INFORMED_FULL = 2     # leader must match ≥ this many active constraints…
+GATE_FULL_MIN_TURN = 3     # …and it must be at least this turn, for full top-k
+GATE_CAP_TURN = 5          # unconditional full top-k from this turn (hit-rate guard)
+GATE_DEPTH = 1             # list length while uninformed
+
+PROFILE_PRIOR_WEIGHT = 0.3
+STALE_PENALTY = 0.75
+MMR_DUP_PENALTY = 0.5
 
 
 class Agent:
@@ -225,7 +256,13 @@ class Agent:
     # -------------------------------------------------------------- interface
 
     def reset(self, session_id: str, user_profile: dict) -> None:
-        self._sessions[session_id] = SessionState(profile=dict(user_profile or {}))
+        state = SessionState(profile=dict(user_profile or {}))
+        tags = state.profile.get("preference_tags")
+        if isinstance(tags, list):
+            state.profile_tags = tuple(
+                normalize_text(str(tag)) for tag in tags if normalize_text(str(tag))
+            )
+        self._sessions[session_id] = state
 
     def respond(self, session_id: str, user_message: str, turn: int, top_k: int) -> dict:
         try:
@@ -244,9 +281,17 @@ class Agent:
             state = SessionState(profile={})
             self._sessions[session_id] = state
         self._extract(state, user_message or "")
+        if self._demo_guard(state, turn):
+            return {
+                "message": "Happy to help — what kind of product are you looking for?",
+                "ask_attribute": "other",
+                "recommendations": [],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+            }
         version = (
             len(state.constraints), len(state.loose_terms), len(state.category_terms),
             state.budget_point, state.anchor is not None,
+            self._n_active(state), len(state.penalized), state.dissatisfied,
         )
         if state.cache_version == version and state.cache_ranking:
             ranked = state.cache_ranking
@@ -256,6 +301,10 @@ class Agent:
             state.cache_version = version
             state.cache_ranking = ranked
         limit = max(0, int(top_k))
+        if FEATURE_GATING:
+            limit = min(limit, self._gate_depth(state, turn, ranked, limit))
+        if FEATURE_MMR and limit > 1 and self._n_active(state) == 0 and state.p_buy < 0.8:
+            ranked = self._mmr_diversify(ranked, limit)
         recommendations = [{"parent_asin": parent_asin} for parent_asin in ranked[:limit]]
         state.stale_shown.update(item["parent_asin"] for item in recommendations)
         # Ask "other" until the card is drained (§5.2) — the boundary one-off
@@ -274,6 +323,65 @@ class Agent:
             "usage": {"prompt_tokens": 0, "completion_tokens": 0},
         }
 
+    # ----------------------------------------------------- gating & priors
+
+    def _n_active(self, state: SessionState) -> int:
+        return sum(
+            1 for constraint in state.constraints
+            if not constraint.is_budget and not constraint.demoted
+        )
+
+    def _demo_guard(self, state: SessionState, turn: int) -> bool:
+        """§5.2 rule 5: a message with nothing extractable (a human typing "Hi")
+        must not fuzzy-match nonsense. The evaluator never produces this shape."""
+        return (
+            turn <= 2
+            and state.anchor is None
+            and not state.constraints
+            and not state.category_terms
+            and state.budget_point is None
+            and len(state.loose_terms) <= 2
+        )
+
+    def _gate_depth(self, state: SessionState, turn: int, ranked: list[str], limit: int) -> int:
+        """§5.4: truncate the list while the ranking is uninformed. Sized from
+        results_shadow_stage2.json — ranks plateau at ~1.05–1.15 by turn 3 and
+        the target never leaves the top-10, so deferring a rank-2+ early hit is
+        strictly better than locking it in; depth 1 still captures genuine
+        rank-1 hits immediately. Escapes protect hit-rate unconditionally."""
+        if turn >= GATE_CAP_TURN or state.drained >= 1 or state.dissatisfied:
+            return limit
+        informed = 1 if state.budget_point is not None else 0
+        if ranked:
+            informed += state.memo.get(ranked[0], (0, 0.0, 0))[2]
+        if informed >= GATE_INFORMED_FULL and turn >= GATE_FULL_MIN_TURN:
+            return limit
+        if FEATURE_PBUY and state.p_buy >= 0.95 and informed >= GATE_INFORMED_FULL:
+            # A fully confident, fully informed buyer: no reason to defer.
+            return limit
+        return GATE_DEPTH
+
+    def _mmr_diversify(self, ranked: list[str], limit: int) -> list[str]:
+        """§5.3: on uninformed full-width turns only, avoid near-duplicate
+        leaders (same store + same title head). Returns a new list."""
+        head: list[str] = []
+        deferred: list[str] = []
+        seen_keys: set[tuple[str, str]] = set()
+        for parent_asin in ranked[: limit * 3]:
+            product = self._products.get(parent_asin, {})
+            title_head = " ".join(_terms(str(product.get("title") or ""))[:3])
+            key = (str(product.get("store") or "").lower(), title_head)
+            if key in seen_keys:
+                deferred.append(parent_asin)
+            else:
+                seen_keys.add(key)
+                head.append(parent_asin)
+            if len(head) >= limit:
+                break
+        merged = head + [item for item in deferred if item not in head]
+        rest = [item for item in ranked if item not in set(merged[: limit * 3])]
+        return merged + rest
+
     # ------------------------------------------------------------- extraction
 
     def _extract(self, state: SessionState, message: str) -> None:
@@ -283,6 +391,7 @@ class Agent:
         lowered = text.lower()
         if _DISSATISFIED_RE.search(lowered):
             state.drained = 0  # resume asking "other" (§5.5)
+            self._strategy_switch(state)
             return
         if _NO_ADDITIONAL_RE.search(lowered):
             state.drained += 1
@@ -315,6 +424,25 @@ class Agent:
         for term in _terms(text):
             if term not in state.loose_terms:
                 state.loose_terms.append(term)
+
+    def _strategy_switch(self, state: SessionState) -> None:
+        """§5.5: the dissatisfaction reply is the ONLY trigger for the stale-rec
+        penalty (§1 fact 13) and the relaxation ladder."""
+        state.dissatisfied = True
+        if FEATURE_STALE_PENALTY:
+            state.penalized = frozenset(state.stale_shown)
+        if FEATURE_RELAXATION:
+            active = [
+                constraint for constraint in state.constraints
+                if not constraint.is_budget and not constraint.demoted
+            ]
+            if len(active) >= 2:  # never relax the only piece of evidence
+                weakest = min(active, key=lambda constraint: constraint.weight)
+                weakest.demoted = True
+                weakest.weight *= 0.1
+        state.memo.clear()
+        state.cache_version = None
+        state.cache_ranking = []
 
     def _mentioned_attribute(self, lowered: str) -> str | None:
         for attribute, phrase in _ATTRIBUTE_WORDS:
@@ -382,9 +510,11 @@ class Agent:
         lowered = tail.lower()
         payload = self._reply_payload(tail)
         if payload is not None:
+            state.p_buy = 0.95  # a hard requirement disclosed at the opening (§5.1)
             for segment in self._split_payload(payload):
                 self._add_constraint(state, segment)
         elif _EXPLORING_RE.search(lowered) or _NO_PREF_RE.search(lowered) or _NO_ADDITIONAL_RE.search(lowered):
+            state.p_buy = 0.15  # explicitly still exploring (§5.1)
             return
         else:
             # intent_override opening: "I'm looking for {cat}. {old_value}" — the
@@ -406,7 +536,9 @@ class Agent:
         state.cache_version = None
         state.cache_ranking = []
         state.stale_shown.clear()  # pre-override showings prove nothing (§1 fact 13)
+        state.penalized = frozenset()
         state.drained = 0
+        state.p_buy = 0.9  # they now know exactly what they want (§5.1)
         match = _OVERRIDE_VALUE_RE.search(text)
         if match:
             for segment in self._split_payload(match.group(1)):
@@ -449,6 +581,7 @@ class Agent:
             return
         state.seen_keys.add(norm)
         state.constraints.append(_Constraint(raw, norm, weight, False, None))
+        state.p_buy = min(0.95, state.p_buy + 0.15)  # constraint mass raises confidence
 
     # -------------------------------------------------------------- retrieval
 
@@ -529,6 +662,19 @@ class Agent:
             score += 0.05 * math.log1p(float(product.get("rating_number") or 0.0))
             if parent_asin in state.anchor_set:
                 score += ANCHOR_BONUS
+            if (
+                FEATURE_PROFILE_PRIOR and not n_scorable
+                and state.budget_point is None and state.profile_tags
+            ):
+                # Zero-evidence turns only: elsewhere constraints dominate and
+                # the aggregate profile is noise (§5.1 prior).
+                text = self._norm_text.get(parent_asin, "")
+                padded = f" {text} "
+                score += PROFILE_PRIOR_WEIGHT * sum(
+                    1 for tag in state.profile_tags if f" {tag} " in padded
+                )
+            if FEATURE_STALE_PENALTY and state.penalized and parent_asin in state.penalized:
+                score -= STALE_PENALTY  # only ever set on dissatisfaction (§5.5)
             scored.append((score, parent_asin))
         scored.sort(key=lambda item: (-item[0], item[1]))
         return [parent_asin for _, parent_asin in scored]

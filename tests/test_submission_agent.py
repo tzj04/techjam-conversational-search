@@ -337,5 +337,144 @@ class RobustExtractionTest(unittest.TestCase):
         self.assertFalse(state.constraints[1].demoted)
 
 
+class GatingTest(unittest.TestCase):
+    def test_uninformed_turn_returns_single_candidate(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        response = agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        self.assertEqual(len(response["recommendations"]), 1)
+
+    def test_informed_turn_three_returns_full_list(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        agent.respond("s", "For that, what matters is: 100% Cotton; Machine wash, cold.", 2, 10)
+        response = agent.respond("s", "For that, what matters is: Premium comfort feel all day.", 3, 10)
+        self.assertEqual(len(response["recommendations"]), 3)  # full mini-catalog
+
+    def test_drained_escape_returns_full_list(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        response = agent.respond("s", "I don't have an additional preference for other.", 2, 10)
+        self.assertEqual(len(response["recommendations"]), 3)
+
+    def test_turn_cap_escape_returns_full_list(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        response = agent.respond("s", "unrecognizable paraphrased customer message here", 5, 10)
+        self.assertEqual(len(response["recommendations"]), 3)
+
+    def test_gating_flag_off_restores_full_lists(self):
+        import submission.agent as module
+
+        original = module.FEATURE_GATING
+        module.FEATURE_GATING = False
+        try:
+            agent = build_agent()
+            agent.reset("s", {})
+            response = agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+            self.assertEqual(len(response["recommendations"]), 3)
+        finally:
+            module.FEATURE_GATING = original
+
+
+class StalePenaltyTest(unittest.TestCase):
+    def test_no_penalty_without_dissatisfaction(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        agent.respond("s", "For that, what matters is: 100% Cotton.", 2, 10)
+        state = agent._sessions["s"]
+        self.assertTrue(state.stale_shown)          # items were shown…
+        self.assertEqual(state.penalized, frozenset())  # …but nothing is penalized
+
+    def test_penalty_applies_only_after_dissatisfaction(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        first = agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        shown = first["recommendations"][0]["parent_asin"]
+        agent.respond(
+            "s", "Those options are not quite right yet. Ask me about one specific attribute.", 2, 10
+        )
+        state = agent._sessions["s"]
+        self.assertIn(shown, state.penalized)
+        self.assertTrue(state.dissatisfied)
+
+
+class RelaxationTest(unittest.TestCase):
+    def test_dissatisfaction_relaxes_weakest_constraint_only(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        agent.respond(
+            "s", "For that, what matters is: Premium comfort feel all day; 100% Cotton.", 2, 10
+        )
+        agent.respond(
+            "s", "Those options are not quite right yet. Ask me about one specific attribute.", 3, 10
+        )
+        state = agent._sessions["s"]
+        by_norm = {constraint.norm: constraint for constraint in state.constraints}
+        self.assertTrue(by_norm["100% cotton"].demoted)          # fewer tokens → weakest
+        self.assertFalse(by_norm["premium comfort feel all day"].demoted)
+
+    def test_sole_constraint_is_never_relaxed(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        agent.respond("s", "For that, what matters is: 100% Cotton.", 2, 10)
+        agent.respond(
+            "s", "Those options are not quite right yet. Ask me about one specific attribute.", 3, 10
+        )
+        self.assertFalse(agent._sessions["s"].constraints[0].demoted)
+
+
+class DemoGuardTest(unittest.TestCase):
+    def test_greeting_returns_no_recommendations(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        response = agent.respond("s", "Hi", 1, 10)
+        self.assertEqual(response["recommendations"], [])
+        self.assertEqual(response["ask_attribute"], "other")
+
+    def test_real_opening_is_untouched_by_guard(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        response = agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        self.assertTrue(response["recommendations"])
+
+
+class SoftRoutingTest(unittest.TestCase):
+    def test_p_buy_tracks_message_shapes(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        self.assertAlmostEqual(agent._sessions["s"].p_buy, 0.15)
+        agent.reset("b", {})
+        agent.respond("b", "I'm looking for Women Dresses. A key requirement is: 100% Cotton.", 1, 10)
+        self.assertGreaterEqual(agent._sessions["b"].p_buy, 0.95)
+        agent.respond("b", "Actually, ignore my earlier preference. What I need is: Machine wash, cold.", 2, 10)
+        self.assertGreaterEqual(agent._sessions["b"].p_buy, 0.9)  # override + new-constraint mass
+
+    def test_profile_prior_only_on_zero_evidence_turns(self):
+        import submission.agent as module
+
+        original = module.FEATURE_PROFILE_PRIOR
+        module.FEATURE_PROFILE_PRIOR = True  # cut from the shipped set; feature still tested
+        try:
+            agent = build_agent()
+            agent.reset("s", {"preference_tags": ["comfort"]})
+            agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+            state = agent._sessions["s"]
+            ranked = state.cache_ranking
+            self.assertEqual(ranked[0], "A001")  # only dress whose text carries "comfort"
+            agent.respond("s", "For that, what matters is: Lightweight polyester shell.", 2, 10)
+            # With evidence present the prior is off: constraint match decides.
+            self.assertEqual(agent._sessions["s"].cache_ranking[0], "A003")
+        finally:
+            module.FEATURE_PROFILE_PRIOR = original
+
+
 if __name__ == "__main__":
     unittest.main()
