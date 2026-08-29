@@ -583,7 +583,9 @@ class FuzzyAnchorTest(unittest.TestCase):
         enter the candidate pool, and no anchor bonus is awarded."""
         agent = build_agent()
         agent.reset("s", {})
-        agent.respond("s", "I'm looking for Women Dresses items, but I'm still exploring.", 1, 10)
+        # "Frocks" is not a catalog category, so neither the suffix nor the
+        # exact infix scan can recover it and the fuzzy path is what runs.
+        agent.respond("s", "I'm looking for Women Frocks, but I'm still exploring.", 1, 10)
         state = agent._sessions["s"]
         self.assertIsNotNone(state.anchor)
         self.assertIn("A001", state.anchor)
@@ -625,3 +627,23 @@ class FieldWeightTest(unittest.TestCase):
         demoted = [c for c in state.constraints if c.norm == live.norm][0]
         self.assertTrue(demoted.demoted)
         self.assertAlmostEqual(demoted.weight * agent_module.FIELD_WEIGHT_RATIO, full * 0.1)
+
+
+class InfixAnchorTest(unittest.TestCase):
+    def test_category_mid_sentence_still_anchors(self):
+        """The suffix scan needs the category to end a clause; a frame that
+        appends text with no delimiter must not lose the anchor."""
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm shopping for Women Dresses but haven't settled on anything.", 1, 10)
+        state = agent._sessions["s"]
+        self.assertIn("A001", state.anchor_set)
+        self.assertEqual(state.anchor_bonus, agent_module.ANCHOR_BONUS)
+
+    def test_infix_prefers_the_longest_exact_key(self):
+        agent = build_agent()
+        self.assertEqual(agent._anchor_infix("I want Women Dresses today"), "women dresses")
+
+    def test_infix_never_matches_a_lone_short_token(self):
+        agent = build_agent()
+        self.assertIsNone(agent._anchor_infix("I am on it"))

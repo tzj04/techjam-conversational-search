@@ -198,6 +198,13 @@ FEATURE_RELAXATION = True
 # FIELD_WEIGHT: the evaluator builds intent cards from `features` + `details`
 #   only, so a constraint found in those fields is stronger evidence than the
 #   same string buried in a long `description`.
+# INFIX_ANCHOR: the anchor scan reads the category as a token *suffix* of a
+#   clause, so any frame that puts words after it with no delimiter loses the
+#   anchor even though the category is present verbatim ("I'm shopping for
+#   {cat} but haven't settled on anything"). That is 54 of 200 openings at L3a.
+#   An exact scan over contiguous token windows recovers 54/54 with 0 wrong
+#   picks -- it is still an exact key lookup, so unlike a fuzzy match it cannot
+#   land on the wrong category.
 # FUZZY_ANCHOR: the anchor scan is an exact key lookup; if the category tail is
 #   reworded the anchor is lost entirely rather than degraded. Measured as a
 #   *scoring* fallback it was actively harmful (L3b 0.832 -> 0.707): on reworded
@@ -214,6 +221,7 @@ FEATURE_BUDGET_GUARD = True
 FEATURE_PARTIAL_MATCH = True
 FEATURE_PARTIAL_IDF_FLOOR = True
 FEATURE_FIELD_WEIGHT = True
+FEATURE_INFIX_ANCHOR = True
 FEATURE_FUZZY_ANCHOR = True
 FEATURE_REGIME_ESCAPE = True
 
@@ -623,6 +631,14 @@ class Agent:
             self._install_anchor(state, key, ANCHOR_BONUS)
             self._apply_opening_tail(state, tail.strip())
             return True
+        if FEATURE_INFIX_ANCHOR:
+            # Exact key on any contiguous token window, longest first. Runs
+            # only after the suffix scan has failed, so clean-set behaviour is
+            # untouched by construction.
+            key = self._anchor_infix(candidates[-1][0])
+            if key is not None:
+                self._install_anchor(state, key, ANCHOR_BONUS)
+                return True
         if FEATURE_FUZZY_ANCHOR:
             # No exact category key: the tail was reworded. Union the closest
             # keys into the candidate pool, but award NO anchor bonus — the
@@ -645,6 +661,20 @@ class Agent:
                 self._apply_opening_tail(state, tail.strip())
                 return True
         return False
+
+    def _anchor_infix(self, text: str) -> str | None:
+        """Longest contiguous token window of `text` that is an exact category
+        key. Longest-first so 'rompers overalls jumpsuits' beats 'jumpsuits'."""
+        tokens = normalize_text(text).split()
+        for width in range(len(tokens), 0, -1):
+            for start in range(0, len(tokens) - width + 1):
+                key = " ".join(tokens[start:start + width])
+                if key not in self._anchor_index:
+                    continue
+                if width == 1 and (len(key) <= 2 or key in STOPWORDS):
+                    continue  # a lone short/function token is not a category
+                return key
+        return None
 
     def _install_anchor(self, state: SessionState, key: str, bonus: float) -> None:
         asins = self._anchor_index[key]
