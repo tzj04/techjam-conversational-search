@@ -199,7 +199,13 @@ FEATURE_RELAXATION = True
 #   only, so a constraint found in those fields is stronger evidence than the
 #   same string buried in a long `description`.
 # FUZZY_ANCHOR: the anchor scan is an exact key lookup; if the category tail is
-#   reworded the anchor is lost entirely rather than degraded.
+#   reworded the anchor is lost entirely rather than degraded. Measured as a
+#   *scoring* fallback it was actively harmful (L3b 0.832 -> 0.707): on reworded
+#   categories the best-overlap key is the wrong set 57 times in 200, and a
+#   wrong anchor bonus buries the target under a whole wrong category. A wrong
+#   anchor costs far more than no anchor. So the two roles the anchor plays are
+#   split: under uncertainty it feeds candidate *generation* only and never the
+#   score, which makes a wrong pick cost nothing but recall.
 # REGIME_ESCAPE: the gate's own "informed" test counts *exact* matches, so under
 #   paraphrase it fails in the same correlated way and the agent sits at depth 1
 #   until GATE_CAP_TURN. Detects "constraints exist but nothing matches" and
@@ -216,8 +222,8 @@ PARTIAL_SCALE = 0.55
 PARTIAL_MIN = 0.34
 PARTIAL_COUNTS_AS_MATCH = 0.80   # coverage at which a partial counts for gating
 FIELD_WEIGHT_BONUS = 0.45        # per constraint matched inside features/details
-FUZZY_ANCHOR_BONUS = 18.0        # vs ANCHOR_BONUS 50.0 for an exact category hit
-FUZZY_ANCHOR_MIN = 0.5           # min token overlap to accept a fuzzy anchor
+FUZZY_ANCHOR_MIN = 0.5           # min token overlap to accept a fuzzy key
+FUZZY_ANCHOR_KEYS = 3            # keys unioned into the pool (recall only)
 
 # Recommendation gating (§5.4), sized from results_shadow_stage2.json: ranks
 # plateau by turn 3 (rank ~1.05–1.15) and nothing leaves the top-10, so a
@@ -597,14 +603,24 @@ class Agent:
             self._apply_opening_tail(state, tail.strip())
             return True
         if FEATURE_FUZZY_ANCHOR:
-            # No exact category key: the tail was reworded. Degrade to the
-            # best token-overlap key at a much smaller bonus instead of losing
-            # the anchor outright. Never fires on the clean set, where the
-            # opening carries the catalog's own category string verbatim.
+            # No exact category key: the tail was reworded. Union the closest
+            # keys into the candidate pool, but award NO anchor bonus — the
+            # best-overlap key is the wrong set often enough that boosting it
+            # is worse than having no anchor at all. Never fires on the clean
+            # set, where the opening carries the catalog's own category string
+            # verbatim.
             head, tail = candidates[-1]
-            key = self._fuzzy_anchor_key(head)
-            if key is not None:
-                self._install_anchor(state, key, FUZZY_ANCHOR_BONUS)
+            keys = self._fuzzy_anchor_keys(head)
+            if keys:
+                pool: list[str] = []
+                for key in keys:
+                    pool.extend(self._anchor_index[key])
+                    for term in _terms(key):
+                        if term not in state.category_terms:
+                            state.category_terms.append(term)
+                state.anchor = tuple(dict.fromkeys(pool))
+                state.anchor_set = frozenset()   # generation only, never scored
+                state.anchor_bonus = 0.0
                 self._apply_opening_tail(state, tail.strip())
                 return True
         return False
@@ -618,28 +634,24 @@ class Agent:
             if term not in state.category_terms:
                 state.category_terms.append(term)
 
-    def _fuzzy_anchor_key(self, head: str) -> str | None:
+    def _fuzzy_anchor_keys(self, head: str) -> list[str]:
+        """Closest category keys by IDF-weighted token overlap. Recall only."""
         tokens = set(_terms(head))
         if not tokens:
-            return None
-        best_key: str | None = None
-        best_score = 0.0
+            return []
+        scored: list[tuple[float, str]] = []
         for key, key_tokens in self._anchor_tokens.items():
-            if not key_tokens:
-                continue
             shared = tokens & key_tokens
             if not shared:
                 continue
-            # Recall-oriented: what fraction of the category key the message
-            # covers, weighted by how informative the shared tokens are.
-            hit = sum(self._idf(token) for token in shared)
             total = sum(self._idf(token) for token in key_tokens)
-            score = (hit / total) if total else 0.0
-            if score > best_score or (score == best_score and best_key is not None
-                                      and len(self._anchor_index[key]) > len(self._anchor_index[best_key])):
-                best_score = score
-                best_key = key
-        return best_key if best_score >= FUZZY_ANCHOR_MIN else None
+            if not total:
+                continue
+            score = sum(self._idf(token) for token in shared) / total
+            if score >= FUZZY_ANCHOR_MIN:
+                scored.append((score, key))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [key for _, key in scored[:FUZZY_ANCHOR_KEYS]]
 
     def _anchor_suffix(self, head: str) -> str | None:
         tokens = normalize_text(head).split()

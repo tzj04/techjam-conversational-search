@@ -554,13 +554,17 @@ class FuzzyAnchorTest(unittest.TestCase):
         self.assertEqual(state.anchor_bonus, agent_module.ANCHOR_BONUS)
         self.assertIn("A001", state.anchor_set)
 
-    def test_reworded_category_degrades_instead_of_vanishing(self):
+    def test_reworded_category_feeds_recall_but_never_the_score(self):
+        """A wrong fuzzy pick must cost nothing but recall: the closest keys
+        enter the candidate pool, and no anchor bonus is awarded."""
         agent = build_agent()
         agent.reset("s", {})
         agent.respond("s", "I'm looking for Women Dresses items, but I'm still exploring.", 1, 10)
         state = agent._sessions["s"]
         self.assertIsNotNone(state.anchor)
-        self.assertEqual(state.anchor_bonus, agent_module.FUZZY_ANCHOR_BONUS)
+        self.assertIn("A001", state.anchor)
+        self.assertEqual(state.anchor_set, frozenset())
+        self.assertEqual(state.anchor_bonus, 0.0)
 
 
 class RegimeEscapeTest(unittest.TestCase):
