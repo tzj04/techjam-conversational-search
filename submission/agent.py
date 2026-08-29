@@ -147,9 +147,8 @@ class _Constraint:
 @dataclass
 class SessionState:
     profile: dict
-    anchor: tuple[str, ...] | None = None
-    anchor_set: frozenset[str] = frozenset()
-    anchor_bonus: float = 0.0
+    anchor: tuple[str, ...] | None = None   # candidate source
+    anchor_set: frozenset[str] = frozenset()  # the subset that also gets the bonus
     category_terms: list[str] = field(default_factory=list)
     loose_terms: list[str] = field(default_factory=list)
     constraints: list[_Constraint] = field(default_factory=list)
@@ -449,7 +448,7 @@ class Agent:
             }
         version = (
             len(state.constraints), len(state.loose_terms), len(state.category_terms),
-            state.budget_point, state.anchor is not None, state.anchor_bonus,
+            state.budget_point, state.anchor is not None, len(state.anchor_set),
             self._n_active(state), len(state.penalized), state.dissatisfied,
         )
         if state.cache_version == version and state.cache_ranking:
@@ -657,7 +656,7 @@ class Agent:
             key = self._anchor_suffix(head)
             if key is None:
                 continue
-            self._install_anchor(state, key, ANCHOR_BONUS)
+            self._install_anchor(state, key)
             self._apply_opening_tail(state, tail.strip())
             return True
         if FEATURE_INFIX_ANCHOR:
@@ -666,7 +665,7 @@ class Agent:
             # untouched by construction.
             key = self._anchor_infix(candidates[-1][0])
             if key is not None:
-                self._install_anchor(state, key, ANCHOR_BONUS)
+                self._install_anchor(state, key)
                 return True
         if FEATURE_FUZZY_ANCHOR:
             # No exact category key: the tail was reworded. Union the closest
@@ -686,7 +685,6 @@ class Agent:
                             state.category_terms.append(term)
                 state.anchor = tuple(dict.fromkeys(pool))
                 state.anchor_set = frozenset()   # generation only, never scored
-                state.anchor_bonus = 0.0
                 self._apply_opening_tail(state, tail.strip())
                 return True
         return False
@@ -705,11 +703,12 @@ class Agent:
                 return key
         return None
 
-    def _install_anchor(self, state: SessionState, key: str, bonus: float) -> None:
+    def _install_anchor(self, state: SessionState, key: str) -> None:
+        """An exact category hit: the set both generates candidates and takes
+        the bonus. `anchor_set` empty (the fuzzy path) means generation only."""
         asins = self._anchor_index[key]
         state.anchor = tuple(asins)
         state.anchor_set = frozenset(asins)
-        state.anchor_bonus = bonus
         for term in _terms(key):
             if term not in state.category_terms:
                 state.category_terms.append(term)
@@ -949,7 +948,7 @@ class Agent:
             score += 0.08 * float(product.get("average_rating") or 0.0)
             score += 0.05 * math.log1p(float(product.get("rating_number") or 0.0))
             if parent_asin in state.anchor_set:
-                score += state.anchor_bonus or ANCHOR_BONUS
+                score += ANCHOR_BONUS
             if (
                 FEATURE_PROFILE_PRIOR and not n_scorable
                 and state.budget_point is None and state.profile_tags

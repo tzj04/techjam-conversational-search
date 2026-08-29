@@ -575,7 +575,6 @@ class FuzzyAnchorTest(unittest.TestCase):
         agent.reset("s", {})
         agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
         state = agent._sessions["s"]
-        self.assertEqual(state.anchor_bonus, agent_module.ANCHOR_BONUS)
         self.assertIn("A001", state.anchor_set)
 
     def test_reworded_category_feeds_recall_but_never_the_score(self):
@@ -591,8 +590,9 @@ class FuzzyAnchorTest(unittest.TestCase):
         state = agent._sessions["s"]
         self.assertIsNotNone(state.anchor)
         self.assertIn("A001", state.anchor)
+        # An empty anchor_set IS the "generation only" invariant: the bonus is
+        # awarded by membership of that set and nothing else.
         self.assertEqual(state.anchor_set, frozenset())
-        self.assertEqual(state.anchor_bonus, 0.0)
 
 
 class RegimeEscapeTest(unittest.TestCase):
@@ -642,7 +642,6 @@ class InfixAnchorTest(unittest.TestCase):
         agent.respond("s", "I'm shopping for Women Dresses but haven't settled on anything.", 1, 10)
         state = agent._sessions["s"]
         self.assertIn("A001", state.anchor_set)
-        self.assertEqual(state.anchor_bonus, agent_module.ANCHOR_BONUS)
 
     def test_infix_prefers_the_longest_exact_key(self):
         agent = build_agent()
