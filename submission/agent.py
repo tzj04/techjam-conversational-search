@@ -1,4 +1,6 @@
-"""Stage 1 submission agent: exact-constraint reranking over a category anchor.
+"""Submission agent: exact-constraint reranking over a category anchor
+(Stage 1), plus question policy, override recovery, and paraphrase-robust
+extraction (Stage 2).
 
 Core ideas (see plan.md):
 - Revealed constraints are verbatim substrings of the target's catalog text
@@ -37,13 +39,42 @@ STOPWORDS = {
 _NORM_RE = re.compile(r"[^a-z0-9$%.\s]|(?<![0-9])[$%.](?![0-9])")
 _BUDGET_WORD_RE = re.compile(r"\b(budget|price|priced|pricing|cost|costs|spend|spending|afford|dollar|dollars|usd)\b")
 _NUMBER_RE = re.compile(r"\$?\d[\d,]*\.?\d*")
-_LOOKING_FOR_RE = re.compile(r"i'?m looking for\s+(.*)$", re.IGNORECASE | re.DOTALL)
-_REPLY_RE = re.compile(r"what matters is:\s*(.+)$", re.IGNORECASE | re.DOTALL)
-_OVERRIDE_RE = re.compile(r"what i need is:\s*(.+)$", re.IGNORECASE | re.DOTALL)
-_REQUIREMENT_RE = re.compile(
-    r"(?:a key requirement is|what i need is|what matters is):?\s*(.+)$",
+# Extraction patterns are written as paraphrase families (Stage 1.5 showed the
+# starter's collapse came from frame brittleness), not as copies of any one
+# evaluator template.
+_PAYLOAD_RE = re.compile(
+    r"(?:matters|care about|prioriti[sz]e|priorit\w*|important|must[- ]?haves?"
+    r"|needs?|requirements?|essentials?|key things?)[^:]*:\s*(.+)$",
     re.IGNORECASE | re.DOTALL,
 )
+_SECONDARY_JOINER_RE = re.compile(r" and also |, plus ")
+# Override pivots open the message; scanning only the first 20 chars keeps
+# payload text (which starts at char ~21+ in every reply frame) out of reach.
+_OVERRIDE_TRIGGER_RE = re.compile(
+    r"\b(actually|instead|forget|ignore|scratch|never ?mind|disregard"
+    r"|change of plans|on second thought|drop that)\b"
+)
+_OVERRIDE_VALUE_RE = re.compile(
+    r"(?:need|want|require|must have|after)[^:]*:\s*(.+)$", re.IGNORECASE | re.DOTALL
+)
+_NO_ADDITIONAL_RE = re.compile(
+    r"\bno additional preference\b|don'?t have (?:an?y? )?additional preference"
+    r"|nothing more to add",
+    re.IGNORECASE,
+)
+_NO_PREF_RE = re.compile(
+    r"\bno (?:real )?preference\b|don'?t have a preference|use your judgment"
+    r"|your judgment is fine|whatever you think",
+    re.IGNORECASE,
+)
+_DISSATISFIED_RE = re.compile(r"not quite (?:right|it|what)", re.IGNORECASE)
+_EXPLORING_RE = re.compile(
+    r"still exploring|just browsing|having a look|look(?:ing)? around"
+    r"|still weighing|haven'?t settled|window shopping",
+    re.IGNORECASE,
+)
+_BOUNDARY_SPLIT_RE = re.compile(r"\. |\? |! | — |, ")
+_ATTRIBUTE_WORDS = [(attribute, attribute.replace("_", " ")) for attribute in ALLOWED_ATTRIBUTES]
 
 
 def normalize_text(text: str) -> str:
@@ -97,6 +128,7 @@ class _Constraint:
     weight: float
     is_budget: bool
     budget_point: float | None
+    demoted: bool = False        # pre-override evidence kept at low weight (§5.5)
 
 
 @dataclass
@@ -109,6 +141,9 @@ class SessionState:
     constraints: list[_Constraint] = field(default_factory=list)
     seen_keys: set[str] = field(default_factory=set)
     budget_point: float | None = None
+    drained: int = 0                              # consecutive "no additional preference"
+    exhausted: set[str] = field(default_factory=set)  # boundary one-off attributes (bookkeeping)
+    stale_shown: set[str] = field(default_factory=set)  # shown asins; penalty wiring is Stage 3
     memo: dict[str, list] = field(default_factory=dict)  # asin -> [n_processed, score, n_matched]
     cache_version: tuple | None = None
     cache_ranking: list[str] = field(default_factory=list)
@@ -125,7 +160,7 @@ BUDGET_NO_PRICE_PENALTY = 0.5
 
 
 class Agent:
-    """Deterministic exact-constraint agent (Stage 1 of plan.md)."""
+    """Deterministic exact-constraint agent (Stages 1–2 of plan.md)."""
 
     def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
         self.catalog_path = Path(catalog_path)
@@ -222,96 +257,160 @@ class Agent:
             state.cache_ranking = ranked
         limit = max(0, int(top_k))
         recommendations = [{"parent_asin": parent_asin} for parent_asin in ranked[:limit]]
-        message = (
-            "Here are my strongest matches so far. Is there another must-have detail I should factor in?"
-            if recommendations
-            else "I need one more detail to narrow this down. Is there another must-have detail I should factor in?"
-        )
+        state.stale_shown.update(item["parent_asin"] for item in recommendations)
+        # Ask "other" until the card is drained (§5.2) — the boundary one-off
+        # ("no preference for other") lands in `exhausted`, never stops the asks.
+        ask_attribute = "other" if state.drained < 2 else None
+        if ask_attribute is None:
+            message = "Here are the closest matches I found."
+        elif recommendations:
+            message = "Here are my strongest matches so far. Is there another must-have detail I should factor in?"
+        else:
+            message = "I need one more detail to narrow this down. Is there another must-have detail I should factor in?"
         return {
             "message": message,
-            "ask_attribute": "other",
+            "ask_attribute": ask_attribute,
             "recommendations": recommendations,
             "usage": {"prompt_tokens": 0, "completion_tokens": 0},
         }
 
     # ------------------------------------------------------------- extraction
 
-    def _is_noise(self, lowered: str) -> bool:
-        return bool(
-            re.search(r"\b(no|don'?t|do not)\s+(?:have\s+)?(?:an?\s+)?(?:additional\s+)?preference\b", lowered)
-            or "use your judgment" in lowered
-            or lowered.startswith("those options are not quite right")
-        )
-
     def _extract(self, state: SessionState, message: str) -> None:
         text = message.strip()
-        if not text or self._is_noise(text.lower()):
+        if not text:
             return
-        match = _LOOKING_FOR_RE.search(text)
-        if match:
-            self._apply_opening(state, match.group(1))
+        lowered = text.lower()
+        if _DISSATISFIED_RE.search(lowered):
+            state.drained = 0  # resume asking "other" (§5.5)
             return
-        match = _REPLY_RE.search(text)
-        if match:
-            payload = match.group(1).strip()
-            if payload.endswith("."):
-                payload = payload[:-1]
-            for segment in payload.split("; "):
+        if _NO_ADDITIONAL_RE.search(lowered):
+            state.drained += 1
+            return
+        if _NO_PREF_RE.search(lowered):
+            attribute = self._mentioned_attribute(lowered)
+            if attribute:
+                state.exhausted.add(attribute)
+            return
+        if state.anchor is None and self._try_opening(state, text):
+            state.drained = 0
+            return
+        if _OVERRIDE_TRIGGER_RE.search(lowered[:20]):
+            self._apply_override(state, text)
+            return
+        payload = self._reply_payload(text)
+        if payload is not None:
+            state.drained = 0
+            if state.anchor is None:
+                # Opening whose category defeated the anchor scan: keep the
+                # pre-payload words as loose retrieval terms.
+                for term in _terms(text[: len(text) - len(payload)]):
+                    if term not in state.loose_terms:
+                        state.loose_terms.append(term)
+            for segment in self._split_payload(payload):
                 self._add_constraint(state, segment)
             return
-        match = _OVERRIDE_RE.search(text)
-        if match:
-            value = match.group(1).strip()
-            if value.endswith("."):
-                value = value[:-1]
-            self._add_constraint(state, value)
-            return
         # Unrecognized shape (paraphrase safety net): keep loose terms for retrieval only.
+        state.drained = 0
         for term in _terms(text):
             if term not in state.loose_terms:
                 state.loose_terms.append(term)
 
-    def _apply_opening(self, state: SessionState, rest: str) -> None:
-        candidates: list[tuple[str, str]] = []
-        for match in re.finditer(r"\. ", rest):
-            candidates.append((rest[:match.start()], rest[match.end():]))
-        but_index = rest.find(", but")
-        if but_index != -1:
-            candidates.append((rest[:but_index], rest[but_index + 2:]))
-        candidates.append((rest.rstrip(" ."), ""))
-        candidates.sort(key=lambda item: len(item[0]))
+    def _mentioned_attribute(self, lowered: str) -> str | None:
+        for attribute, phrase in _ATTRIBUTE_WORDS:
+            if re.search(rf"\b{re.escape(phrase)}\b", lowered):
+                return attribute
+        return None
 
-        category_phrase, remainder = "", ""
-        for phrase, tail in candidates:
-            key = normalize_text(phrase)
-            if key and key in self._anchor_index:
-                category_phrase, remainder = phrase, tail
-                asins = self._anchor_index[key]
-                state.anchor = tuple(asins)
-                state.anchor_set = frozenset(asins)
-                break
-        if not state.anchor:
-            category_phrase, remainder = candidates[0] if candidates else (rest, "")
-        for term in _terms(category_phrase):
-            if term not in state.category_terms:
-                state.category_terms.append(term)
-
-        remainder = remainder.strip()
-        if not remainder:
-            return
-        match = _REQUIREMENT_RE.match(remainder)
+    def _reply_payload(self, text: str) -> str | None:
+        match = _PAYLOAD_RE.search(text)
         if match:
-            value = match.group(1).strip()
-            if value.endswith("."):
-                value = value[:-1]
-            self._add_constraint(state, value)
-        elif re.match(r"but i'?m still exploring", remainder, re.IGNORECASE):
+            return match.group(1).strip()
+        # Last resort: a colon-introduced tail that carries the "; " list joiner.
+        head, sep, rest = text.partition(": ")
+        if sep and "; " in rest:
+            return rest.strip()
+        return None
+
+    def _split_payload(self, payload: str) -> list[str]:
+        payload = payload.strip()
+        if payload.endswith("."):
+            payload = payload[:-1]  # sentence suffix only — never inner periods
+        segments: list[str] = []
+        for segment in payload.split("; "):
+            for piece in _SECONDARY_JOINER_RE.split(segment):
+                piece = piece.strip()
+                if piece:
+                    segments.append(piece)
+        return segments
+
+    def _try_opening(self, state: SessionState, text: str) -> bool:
+        """Token-suffix anchor scan: the category tail is a suffix of the lead-in
+        clause under any verb rewording ("Help me track down {cat}")."""
+        candidates: list[tuple[str, str]] = []
+        for match in _BOUNDARY_SPLIT_RE.finditer(text):
+            candidates.append((text[:match.start()], text[match.end():]))
+        candidates.append((text.rstrip(" .?!"), ""))
+        candidates.sort(key=lambda item: len(item[0]))
+        for head, tail in candidates:
+            key = self._anchor_suffix(head)
+            if key is None:
+                continue
+            asins = self._anchor_index[key]
+            state.anchor = tuple(asins)
+            state.anchor_set = frozenset(asins)
+            for term in _terms(key):
+                if term not in state.category_terms:
+                    state.category_terms.append(term)
+            self._apply_opening_tail(state, tail.strip())
+            return True
+        return False
+
+    def _anchor_suffix(self, head: str) -> str | None:
+        tokens = normalize_text(head).split()
+        for start in range(len(tokens)):
+            key = " ".join(tokens[start:])
+            if key in self._anchor_index:
+                if start == len(tokens) - 1 and (len(key) <= 2 or key in STOPWORDS):
+                    continue  # single short/function token — not a credible category
+                return key
+        return None
+
+    def _apply_opening_tail(self, state: SessionState, tail: str) -> None:
+        if not tail:
             return
-        elif not self._is_noise(remainder.lower()):
+        lowered = tail.lower()
+        payload = self._reply_payload(tail)
+        if payload is not None:
+            for segment in self._split_payload(payload):
+                self._add_constraint(state, segment)
+        elif _EXPLORING_RE.search(lowered) or _NO_PREF_RE.search(lowered) or _NO_ADDITIONAL_RE.search(lowered):
+            return
+        else:
             # intent_override opening: "I'm looking for {cat}. {old_value}" — the
             # old preference is still true of the target (§1 fact 10).
-            value = remainder[:-1] if remainder.endswith(".") else remainder
+            value = tail[:-1] if tail.endswith(".") else tail
             self._add_constraint(state, value)
+
+    def _apply_override(self, state: SessionState, text: str) -> None:
+        """§5.5: demote (not delete) prior evidence; the asymmetric scoring of
+        demoted constraints is the consistency gate."""
+        for constraint in state.constraints:
+            if not constraint.demoted:
+                constraint.demoted = True
+                if not constraint.is_budget:
+                    constraint.weight *= 0.1
+        state.budget_point = None  # old budget may be the overridden preference
+        state.seen_keys = {key for key in state.seen_keys if not key.startswith("budget:")}
+        state.memo.clear()  # demotion rewrites weights — incremental memo is stale
+        state.cache_version = None
+        state.cache_ranking = []
+        state.stale_shown.clear()  # pre-override showings prove nothing (§1 fact 13)
+        state.drained = 0
+        match = _OVERRIDE_VALUE_RE.search(text)
+        if match:
+            for segment in self._split_payload(match.group(1)):
+                self._add_constraint(state, segment)
 
     def _add_constraint(self, state: SessionState, raw: str) -> None:
         raw = raw.strip()
@@ -332,10 +431,23 @@ class Agent:
             return
         body = re.sub(r"^color:\s*", "", raw, flags=re.IGNORECASE)
         norm = normalize_text(body)
-        if not norm or norm in state.seen_keys:
+        if not norm:
+            return
+        weight = 0.8 + 0.55 * min(len(norm.split()), 12)
+        if norm in state.seen_keys:
+            # Re-revealed after an override (the simulator can re-reveal the
+            # "ignored" value — §1 fact 10): promote back to full weight.
+            promoted = False
+            for constraint in state.constraints:
+                if constraint.norm == norm and constraint.demoted:
+                    constraint.demoted = False
+                    constraint.weight = weight
+                    promoted = True
+            if promoted:
+                state.memo.clear()
+                state.cache_version = None
             return
         state.seen_keys.add(norm)
-        weight = 0.8 + 0.55 * min(len(norm.split()), 12)
         state.constraints.append(_Constraint(raw, norm, weight, False, None))
 
     # -------------------------------------------------------------- retrieval
@@ -384,7 +496,7 @@ class Agent:
 
     def _score_pool(self, state: SessionState, pool: Iterable[str]) -> list[str]:
         constraints = state.constraints
-        n_scorable = sum(1 for constraint in constraints if not constraint.is_budget)
+        n_scorable = sum(1 for constraint in constraints if not constraint.is_budget and not constraint.demoted)
         scored: list[tuple[float, str]] = []
         for parent_asin in pool:
             product = self._products.get(parent_asin)
@@ -400,9 +512,13 @@ class Agent:
                     if constraint.is_budget:
                         continue
                     if constraint.norm in text:
+                        # Demoted evidence adds its (already 0.1×) weight when
+                        # matched but never penalizes when absent — that
+                        # asymmetry is the §5.5 consistency gate.
                         entry[1] += constraint.weight
-                        entry[2] += 1
-                    else:
+                        if not constraint.demoted:
+                            entry[2] += 1
+                    elif not constraint.demoted:
                         entry[1] -= UNMATCHED_PENALTY
                 entry[0] = len(constraints)
             score = entry[1]

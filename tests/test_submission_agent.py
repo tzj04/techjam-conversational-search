@@ -167,5 +167,175 @@ class RespondSchemaTest(unittest.TestCase):
         self.assertEqual(response["recommendations"][0]["parent_asin"], "A001")
 
 
+class QuestionPolicyTest(unittest.TestCase):
+    def test_null_only_after_two_no_additional_replies(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        first = agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        self.assertEqual(first["ask_attribute"], "other")
+        second = agent.respond("s", "I don't have an additional preference for other.", 2, 10)
+        self.assertEqual(second["ask_attribute"], "other")
+        third = agent.respond("s", "I don't have an additional preference for other.", 3, 10)
+        self.assertIsNone(third["ask_attribute"])
+
+    def test_boundary_no_preference_for_other_does_not_stop_asks(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        response = agent.respond(
+            "s", "I don't have a preference for other; please use your judgment.", 2, 10
+        )
+        self.assertEqual(response["ask_attribute"], "other")
+        self.assertIn("other", agent._sessions["s"].exhausted)
+        self.assertEqual(agent._sessions["s"].drained, 0)
+
+    def test_drained_resets_on_contentful_reply(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        agent.respond("s", "I don't have an additional preference for other.", 2, 10)
+        self.assertEqual(agent._sessions["s"].drained, 1)
+        agent.respond("s", "For that, what matters is: 100% Cotton.", 3, 10)
+        self.assertEqual(agent._sessions["s"].drained, 0)
+
+    def test_dissatisfaction_resumes_asking(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        agent.respond("s", "I don't have an additional preference for other.", 2, 10)
+        agent.respond("s", "I don't have an additional preference for other.", 3, 10)
+        response = agent.respond(
+            "s", "Those options are not quite right yet. Ask me about one specific attribute.", 4, 10
+        )
+        self.assertEqual(response["ask_attribute"], "other")
+
+
+class OverrideRecoveryTest(unittest.TestCase):
+    def _session_with_override(self) -> Agent:
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        agent.respond("s", "For that, what matters is: 100% Cotton.", 2, 10)
+        return agent
+
+    def test_override_demotes_not_deletes(self):
+        agent = self._session_with_override()
+        old_weight = agent._sessions["s"].constraints[0].weight
+        agent.respond(
+            "s", "Actually, ignore my earlier preference. What I need is: Lightweight polyester shell.", 3, 10
+        )
+        state = agent._sessions["s"]
+        old = state.constraints[0]
+        self.assertTrue(old.demoted)
+        self.assertAlmostEqual(old.weight, old_weight * 0.1)
+        self.assertFalse(state.constraints[1].demoted)
+        # Matched demoted evidence still contributes: A001 (matches old only)
+        # outscores A002 (matches neither) on the pure constraint score.
+        self.assertGreater(state.memo["A001"][1], state.memo["A002"][1])
+
+    def test_consistency_gate_unmatched_demoted_costs_nothing(self):
+        agent = self._session_with_override()
+        agent.respond(
+            "s", "Actually, ignore my earlier preference. What I need is: Lightweight polyester shell.", 3, 10
+        )
+        state = agent._sessions["s"]
+        # A002 matches neither constraint: only the ACTIVE one penalizes.
+        from submission.agent import UNMATCHED_PENALTY
+
+        self.assertAlmostEqual(state.memo["A002"][1], -UNMATCHED_PENALTY)
+
+    def test_memo_invalidated_on_override(self):
+        agent = self._session_with_override()
+        before = agent._sessions["s"].memo["A001"][1]
+        self.assertGreater(before, 0)  # full-weight match on "100% cotton"
+        agent.respond(
+            "s", "Actually, ignore my earlier preference. What I need is: Lightweight polyester shell.", 3, 10
+        )
+        after = agent._sessions["s"].memo["A001"][1]
+        self.assertLess(after, before)  # rescored under demotion, not stale
+
+    def test_override_ranks_new_value_first_and_clears_stale(self):
+        agent = self._session_with_override()
+        self.assertTrue(agent._sessions["s"].stale_shown)
+        response = agent.respond(
+            "s", "Actually, ignore my earlier preference. What I need is: Lightweight polyester shell.", 3, 10
+        )
+        self.assertEqual(response["recommendations"][0]["parent_asin"], "A003")
+        # stale_shown was cleared on override, then repopulated by this turn.
+        self.assertEqual(
+            agent._sessions["s"].stale_shown,
+            {item["parent_asin"] for item in response["recommendations"]},
+        )
+
+    def test_override_drops_budget_unless_reasserted(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        agent.respond("s", "For that, what matters is: budget around $79.99.", 2, 10)
+        self.assertEqual(agent._sessions["s"].budget_point, 79.99)
+        agent.respond(
+            "s", "Actually, ignore my earlier preference. What I need is: Machine wash, cold.", 3, 10
+        )
+        self.assertIsNone(agent._sessions["s"].budget_point)
+
+
+class RobustExtractionTest(unittest.TestCase):
+    def test_suffix_anchor_scan_under_reworded_opening(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "Help me track down Women Dresses — just browsing for now.", 1, 10)
+        self.assertEqual(set(agent._sessions["s"].anchor_set), {"A001", "A003"})
+
+    def test_reworded_opening_keeps_trailing_constraint(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm shopping for Women Dresses. Lightweight polyester shell", 1, 10)
+        state = agent._sessions["s"]
+        self.assertEqual(set(state.anchor_set), {"A001", "A003"})
+        self.assertEqual(len(state.constraints), 1)
+        self.assertIn(state.constraints[0].norm, agent._norm_text["A003"])
+
+    def test_reworded_reply_frame_still_captured(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        agent.respond("s", "Here's what I care about: Machine wash, cold.", 2, 10)
+        state = agent._sessions["s"]
+        self.assertEqual(len(state.constraints), 1)
+        self.assertIn(state.constraints[0].norm, agent._norm_text["A001"])
+
+    def test_case_flipped_constraint_still_matches(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        agent.respond("s", "For that, what matters is: 100% cotton; machine wash, cold.", 2, 10)
+        state = agent._sessions["s"]
+        self.assertEqual(len(state.constraints), 2)
+        for constraint in state.constraints:
+            self.assertIn(constraint.norm, agent._norm_text["A001"])
+
+    def test_secondary_joiner_splits_payload(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        agent.respond("s", "For that, what matters is: 100% Cotton and also Machine wash, cold.", 2, 10)
+        state = agent._sessions["s"]
+        self.assertEqual(len(state.constraints), 2)
+        for constraint in state.constraints:
+            self.assertIn(constraint.norm, agent._norm_text["A001"])
+
+    def test_reworded_override_still_demotes(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        agent.respond("s", "For that, what matters is: 100% Cotton.", 2, 10)
+        agent.respond(
+            "s", "On second thought, forget what I said earlier. What I need is: Lightweight polyester shell.", 3, 10
+        )
+        state = agent._sessions["s"]
+        self.assertTrue(state.constraints[0].demoted)
+        self.assertFalse(state.constraints[1].demoted)
+
+
 if __name__ == "__main__":
     unittest.main()
