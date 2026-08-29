@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import submission.agent as agent_module
 from submission.agent import (
     ALLOWED_ATTRIBUTES,
     Agent,
@@ -478,3 +479,215 @@ class SoftRoutingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BudgetMisroutingGuardTest(unittest.TestCase):
+    """A money *word* inside a long features string is not a budget disclosure.
+    Before the guard it was routed to the price path, its text discarded and a
+    bogus filter applied from whatever digit appeared first."""
+
+    LONG = (
+        "WELL PRICED, TIMELESS STYLE - Traditional in its design, this "
+        "inexpensive but very durable 100% Cotton shirt is built to last"
+    )
+
+    def test_long_priced_string_stays_lexical(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        agent.respond("s", f"For that, what matters is: {self.LONG}.", 2, 10)
+        state = agent._sessions["s"]
+        self.assertIsNone(state.budget_point)
+        self.assertEqual(len(state.constraints), 1)
+        self.assertFalse(state.constraints[0].is_budget)
+        self.assertIn("cotton", state.constraints[0].norm)
+
+    def test_real_budget_disclosures_still_route_to_price(self):
+        for phrase in (
+            "budget around $79.99",
+            "my budget's about 79.99 dollars",
+            "somewhere around $79.99 works for me",
+            "I can spend around $79.99",
+        ):
+            with self.subTest(phrase=phrase):
+                agent = build_agent()
+                agent.reset("s", {})
+                agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+                agent.respond("s", f"For that, what matters is: {phrase}.", 2, 10)
+                self.assertEqual(agent._sessions["s"].budget_point, 79.99)
+
+
+class PartialMatchTest(unittest.TestCase):
+    def test_coverage_is_one_for_identical_and_zero_for_disjoint(self):
+        agent = build_agent()
+        agent_module.FEATURE_PARTIAL_IDF_FLOOR = False
+        try:
+            text = agent._token_text["A001"]
+            self.assertAlmostEqual(agent._coverage("100% cotton", text), 1.0)
+            self.assertEqual(agent._coverage("zzzz qqqq", text), 0.0)
+            # A reworded payload keeps partial credit rather than scoring zero.
+            boot = agent._token_text["A002"]
+            self.assertGreater(agent._coverage("soles made of rubber", boot), 0.0)
+        finally:
+            agent_module.FEATURE_PARTIAL_IDF_FLOOR = True
+
+    def test_idf_floor_scales_with_the_catalog(self):
+        """The floor is 'one token at 5% document frequency', evaluated against
+        whatever catalog is loaded — not a constant that assumes 50k rows."""
+        agent = build_agent()
+        self.assertEqual(agent._n_docs, len(MINI_CATALOG))
+        expected = __import__("math").log(
+            (agent._n_docs + 1.0)
+            / (agent_module.PARTIAL_IDF_QUANTILE * agent._n_docs + 1.0)
+        )
+        self.assertAlmostEqual(agent._partial_min_idf, expected)
+
+    def test_idf_floor_suppresses_uninformative_partial_evidence(self):
+        """Matching only common words must score zero, not a high ratio."""
+        agent = build_agent()
+        agent._n_docs = 50000
+        agent._doc_freq = {"made": 40000, "of": 45000, "unobtanium": 1}
+        text = " made of "
+        self.assertEqual(agent._coverage("made of", text), 0.0)
+        self.assertGreater(agent._coverage("unobtanium", " unobtanium "), 0.0)
+
+    def test_reworded_payload_still_ranks_the_right_product(self):
+        """'Rubber sole' -> 'soles made of Rubber' is a total loss under the
+        whole-string substring test; graded coverage keeps the signal."""
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Men Boots.", 1, 10)
+        response = agent.respond("s", "What matters to me is: soles made of Rubber.", 2, 10)
+        agent._sessions["s"].drained = 1  # force full-width output
+        response = agent.respond("s", "I don't have an additional preference for other.", 3, 10)
+        self.assertEqual(response["recommendations"][0]["parent_asin"], "A002")
+
+    def test_full_substring_match_outscores_any_partial(self):
+        agent = build_agent()
+        weight = 3.0
+        best_partial = weight * agent_module.PARTIAL_SCALE * 1.0 * 1.0
+        self.assertLess(best_partial, weight)
+
+
+class FuzzyAnchorTest(unittest.TestCase):
+    def test_exact_category_takes_the_full_bonus(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        state = agent._sessions["s"]
+        self.assertEqual(state.anchor_bonus, agent_module.ANCHOR_BONUS)
+        self.assertIn("A001", state.anchor_set)
+
+    def test_reworded_category_feeds_recall_but_never_the_score(self):
+        """A wrong fuzzy pick must cost nothing but recall: the closest keys
+        enter the candidate pool, and no anchor bonus is awarded."""
+        agent = build_agent()
+        agent.reset("s", {})
+        # "Frocks" is not a catalog category, so neither the suffix nor the
+        # exact infix scan can recover it and the fuzzy path is what runs.
+        agent_module.FEATURE_FUZZY_ANCHOR = True
+        self.addCleanup(setattr, agent_module, "FEATURE_FUZZY_ANCHOR", False)
+        agent.respond("s", "I'm looking for Women Frocks, but I'm still exploring.", 1, 10)
+        state = agent._sessions["s"]
+        self.assertIsNotNone(state.anchor)
+        self.assertIn("A001", state.anchor)
+        self.assertEqual(state.anchor_set, frozenset())
+        self.assertEqual(state.anchor_bonus, 0.0)
+
+
+class RegimeEscapeTest(unittest.TestCase):
+    def test_gate_opens_when_nothing_matches(self):
+        """Constraints held but the leader matches none of them: the exact
+        matcher has failed, so deferring to GATE_CAP_TURN only burns turns."""
+        agent = build_agent()
+        agent_module.FEATURE_REGIME_ESCAPE = True
+        self.addCleanup(setattr, agent_module, "FEATURE_REGIME_ESCAPE", False)
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        response = agent.respond(
+            "s", "What matters to me is: qqqqzzz wwwwvvv; xxxxyyy uuuuttt.", 2, 10
+        )
+        self.assertGreater(len(response["recommendations"]), 1)
+
+    def test_gate_still_defers_when_matching_works(self):
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses, but I'm still exploring.", 1, 10)
+        response = agent.respond("s", "What matters to me is: 100% Cotton; Machine wash, cold.", 2, 10)
+        self.assertEqual(len(response["recommendations"]), agent_module.GATE_DEPTH)
+
+
+class FieldWeightTest(unittest.TestCase):
+    def test_field_bonus_respects_the_demotion_asymmetry(self):
+        """Demoted override evidence is kept at 0.1x weight. A flat field bonus
+        would hand it back full strength; a proportional one scales with it."""
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm looking for Women Dresses. Machine wash, cold", 1, 10)
+        state = agent._sessions["s"]
+        live = [c for c in state.constraints if not c.is_budget][0]
+        full = live.weight * agent_module.FIELD_WEIGHT_RATIO
+        agent.respond("s", "Actually, ignore my earlier preference. What I need is: 100% Cotton.", 2, 10)
+        demoted = [c for c in state.constraints if c.norm == live.norm][0]
+        self.assertTrue(demoted.demoted)
+        self.assertAlmostEqual(demoted.weight * agent_module.FIELD_WEIGHT_RATIO, full * 0.1)
+
+
+class InfixAnchorTest(unittest.TestCase):
+    def test_category_mid_sentence_still_anchors(self):
+        """The suffix scan needs the category to end a clause; a frame that
+        appends text with no delimiter must not lose the anchor."""
+        agent = build_agent()
+        agent.reset("s", {})
+        agent.respond("s", "I'm shopping for Women Dresses but haven't settled on anything.", 1, 10)
+        state = agent._sessions["s"]
+        self.assertIn("A001", state.anchor_set)
+        self.assertEqual(state.anchor_bonus, agent_module.ANCHOR_BONUS)
+
+    def test_infix_prefers_the_longest_exact_key(self):
+        agent = build_agent()
+        self.assertEqual(agent._anchor_infix("I want Women Dresses today"), "women dresses")
+
+    def test_infix_never_matches_a_lone_short_token(self):
+        agent = build_agent()
+        self.assertIsNone(agent._anchor_infix("I am on it"))
+
+
+class MultiQueryRetrievalTest(unittest.TestCase):
+    def test_each_constraint_contributes_candidates_independently(self):
+        """A single OR-of-everything query lets BM25 favour documents matching
+        many common terms; a rare constraint can then contribute nothing."""
+        agent = build_agent()
+        agent_module.FEATURE_MULTI_QUERY = True
+        try:
+            agent.reset("s", {})
+            agent.respond("s", "I'm looking for Men Boots.", 1, 10)
+            state = agent._sessions["s"]
+            state.anchor = None
+            state.anchor_set = frozenset()
+            agent._add_constraint(state, "Waterproof membrane")
+            pool = agent._build_pool(state, 10)
+            self.assertIn("A002", pool)
+        finally:
+            agent_module.FEATURE_MULTI_QUERY = False
+
+
+class DocumentFrequencyTest(unittest.TestCase):
+    def test_doc_freq_uses_the_same_tokenizer_as_coverage(self):
+        """_coverage looks tokens up by `_terms` output. If _doc_freq were
+        built by splitting the normal form it would key numeric tokens as
+        "100%" while lookups ask for "100", making common numbers look
+        maximally rare -- and percentage constraints are mostly numbers."""
+        agent = build_agent()
+        for token in agent._doc_freq:
+            self.assertEqual([token], _terms_of(token), token)
+
+    def test_numeric_token_frequency_is_counted(self):
+        agent = build_agent()
+        # "100% Cotton" appears in A001's features and details.
+        self.assertGreater(agent._doc_freq.get("100", 0), 0)
+
+
+def _terms_of(text):
+    from submission.agent import _terms
+    return _terms(text)

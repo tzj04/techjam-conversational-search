@@ -39,6 +39,18 @@ STOPWORDS = {
 # becomes a single space. Applied identically to product text and constraints.
 _NORM_RE = re.compile(r"[^a-z0-9$%.\s]|(?<![0-9])[$%.](?![0-9])")
 _BUDGET_WORD_RE = re.compile(r"\b(budget|price|priced|pricing|cost|costs|spend|spending|afford|dollar|dollars|usd)\b")
+# A money *word* is not a budget disclosure. 414/50,000 catalog products carry
+# one inside a features/details string ("WELL PRICED, TIMELESS STYLE - ...",
+# "Top present under 30 dollars for a Birthday..."), and such a string can be
+# revealed as an ordinary constraint. Under the bare word test it was routed to
+# the budget path, its text discarded, and a bogus price filter applied from
+# whatever digit appeared first. A real disclosure is short and number-adjacent.
+_BUDGET_PHRASE_RE = re.compile(
+    r"\$\s*\d"
+    r"|\b(?:budget|price[ds]?|pricing|cost[s]?|spend(?:ing)?|afford)\b[^.]{0,24}?\d"
+    r"|\b\d[\d,]*(?:\.\d+)?\s*(?:dollars?|usd)\b"
+)
+BUDGET_MAX_CHARS = 64
 _NUMBER_RE = re.compile(r"\$?\d[\d,]*\.?\d*")
 # Extraction patterns are written as paraphrase families (Stage 1.5 showed the
 # starter's collapse came from frame brittleness), not as copies of any one
@@ -137,6 +149,7 @@ class SessionState:
     profile: dict
     anchor: tuple[str, ...] | None = None
     anchor_set: frozenset[str] = frozenset()
+    anchor_bonus: float = 0.0
     category_terms: list[str] = field(default_factory=list)
     loose_terms: list[str] = field(default_factory=list)
     constraints: list[_Constraint] = field(default_factory=list)
@@ -176,6 +189,94 @@ FEATURE_MMR = False
 FEATURE_STALE_PENALTY = True
 FEATURE_RELAXATION = True
 
+# Stage 4 (robustness). Each targets a *named* failure mechanism measured by
+# tools/l3_eval.py, not a tuned constant. See REPORT §6.
+#
+# PARTIAL_MATCH: exact-substring matching is all-or-nothing, so a payload
+#   reworded anywhere ("Rubber sole" -> "soles made of Rubber") scores exactly
+#   as badly as an unrelated product. Falls back to IDF-weighted token coverage.
+# FIELD_WEIGHT: the evaluator builds intent cards from `features` + `details`
+#   only, so a constraint found in those fields is stronger evidence than the
+#   same string buried in a long `description`.
+# INFIX_ANCHOR: the anchor scan reads the category as a token *suffix* of a
+#   clause, so any frame that puts words after it with no delimiter loses the
+#   anchor even though the category is present verbatim ("I'm shopping for
+#   {cat} but haven't settled on anything"). That is 54 of 200 openings at L3a.
+#   An exact scan over contiguous token windows recovers 54/54 with 0 wrong
+#   picks -- it is still an exact key lookup, so unlike a fuzzy match it cannot
+#   land on the wrong category.
+# FUZZY_ANCHOR: the anchor scan is an exact key lookup; if the category tail is
+#   reworded the anchor is lost entirely rather than degraded. Measured as a
+#   *scoring* fallback it was actively harmful (L3b 0.832 -> 0.707): on reworded
+#   categories the best-overlap key is the wrong set 57 times in 200, and a
+#   wrong anchor bonus buries the target under a whole wrong category. A wrong
+#   anchor costs far more than no anchor. So the two roles the anchor plays are
+#   split: under uncertainty it feeds candidate *generation* only and never the
+#   score, which makes a wrong pick cost nothing but recall.
+# REGIME_ESCAPE: the gate's own "informed" test counts *exact* matches, so under
+#   paraphrase it fails in the same correlated way and the agent sits at depth 1
+#   until GATE_CAP_TURN. Detects "constraints exist but nothing matches" and
+#   opens the gate.
+FEATURE_BUDGET_GUARD = True
+FEATURE_PARTIAL_MATCH = True
+FEATURE_PARTIAL_IDF_FLOOR = True
+FEATURE_FIELD_WEIGHT = True
+FEATURE_INFIX_ANCHOR = True
+# CUT on measurement. As a scoring fallback it was catastrophic (L3b 0.832112
+# -> 0.674195): the best-overlap key is the wrong set 57 times in 200, and a
+# wrong anchor bonus buries the target under a whole wrong category. Redesigned
+# to feed candidate generation only, it recovered 146 of those 158 points but
+# is still net negative where it exists to help -- isolated, L3b 0.832112 ->
+# 0.820135; in combination, removing it takes L3b 0.871357 -> 0.875537 with
+# clean and L3a unchanged to six decimals. Together with the multi-query result
+# (also candidate-adding, also ~-0.012 at L3b) the conclusion is that the pool
+# is not usefully recall-limited: extra candidates cost more in precision than
+# the recovered targets are worth. INFIX_ANCHOR gets the same 54 openings back
+# by exact lookup, with no wrong picks and no pool growth at all.
+FEATURE_FUZZY_ANCHOR = False
+# CUT on measurement. Isolated it is negative (L3a 0.887002 -> 0.884241,
+# -0.0028) for the same reason the p_buy escape was cut at -0.0027: opening
+# the gate early re-creates the lock-ins gating exists to prevent. Waiting
+# still pays under paraphrase, because the ranking keeps improving from loose
+# terms and later constraints even when no payload matches exactly. In
+# combination it is inert (+/-0.0003, opposite signs at L3a and L3b) because
+# PARTIAL_MATCH counts high-coverage partials toward the gate's `informed`
+# test -- so the correlated blindness this was built to break is already fixed
+# upstream by a feature that measures positive. Retained behind the flag.
+FEATURE_REGIME_ESCAPE = False
+# MULTI_QUERY: retrieval fires a single FTS query built as an OR of up to 40
+#   terms, so BM25 favours documents matching many *common* terms and a
+#   constraint whose vocabulary is rare can contribute no candidates at all.
+#   At L3b that is 5 of 12 remaining misses, where the target never enters the
+#   pool. One query per constraint guarantees each contributes independently.
+#   CUT on measurement: it does fix recall, but the extra candidates cost more
+#   in precision than the recovered targets are worth. Holding everything else
+#   constant, L3b fell 0.871357 -> 0.858485 with hit 0.935 -> 0.915, while
+#   clean and L3a were unchanged to six decimals. Diagnosing the cause
+#   correctly (5 of 12 L3b misses never enter the pool) did not make the
+#   obvious remedy net-positive. Retained behind the flag with its delta.
+FEATURE_MULTI_QUERY = False
+MULTI_QUERY_LIMIT = 120
+
+# Partial matching. Sub-additive in coverage so a full substring match always
+# dominates any partial one; below PARTIAL_MIN coverage nothing is awarded.
+PARTIAL_SCALE = 0.55
+PARTIAL_MIN = 0.34
+# Coverage is a *ratio*, so matching one of two common words ("made", "of")
+# scores 0.5 while carrying no information. Partial evidence must also be
+# discriminative in absolute terms: the matched tokens must carry at least the
+# information of one token appearing in `PARTIAL_IDF_QUANTILE` of the catalog.
+# Stated as a rule about the catalog and evaluated against it, not fitted to a
+# score. (On the 50k catalog this evaluates to 2.996.)
+PARTIAL_IDF_QUANTILE = 0.05
+PARTIAL_COUNTS_AS_MATCH = 0.80   # coverage at which a partial counts for gating
+# Proportional, not flat: a flat bonus would hand demoted (0.1x) override
+# evidence its full value and break the §5.5 consistency asymmetry, and it
+# would reward a bare material word as much as a 120-char feature string.
+FIELD_WEIGHT_RATIO = 0.25        # of the constraint's own weight
+FUZZY_ANCHOR_MIN = 0.5           # min token overlap to accept a fuzzy key
+FUZZY_ANCHOR_KEYS = 3            # keys unioned into the pool (recall only)
+
 # Recommendation gating (§5.4), sized from results_shadow_stage2.json: ranks
 # plateau by turn 3 (rank ~1.05–1.15) and nothing leaves the top-10, so a
 # rank-2+ turn-1 hit is a pure loss vs deferring. Depth 1 keeps genuine
@@ -199,7 +300,12 @@ class Agent:
         self._sessions: dict[str, SessionState] = {}
         self._products: dict[str, dict] = {}
         self._norm_text: dict[str, str] = {}
+        self._card_text: dict[str, str] = {}   # title+features+details only
+        self._token_text: dict[str, str] = {}  # space-delimited unique content tokens
         self._anchor_index: dict[str, list[str]] = {}
+        self._anchor_tokens: dict[str, frozenset[str]] = {}
+        self._doc_freq: dict[str, int] = {}
+        self._n_docs: int = 0
         self._fallback_order: list[str] = []
         self._build_index()
 
@@ -207,6 +313,7 @@ class Agent:
 
     def _build_index(self) -> None:
         cursor = self.connection.cursor()
+        doc_freq = self._doc_freq
         cursor.execute(
             "CREATE VIRTUAL TABLE products USING fts5("
             "parent_asin UNINDEXED, title, categories, features, details, store, description, "
@@ -227,6 +334,23 @@ class Agent:
                     parts.extend(_flatten_field(product.get(field_name)))
                 parts.append(str(product.get("store") or ""))
                 self._norm_text[parent_asin] = normalize_text(" ".join(parts))
+                # The evaluator's intent_card draws its constraint candidates
+                # from `features` + `details` only, so a match inside those
+                # fields is stronger evidence than one in a long description.
+                card_parts = [str(product.get("title") or "")]
+                for field_name in ("features", "details"):
+                    card_parts.extend(_flatten_field(product.get(field_name)))
+                self._card_text[parent_asin] = normalize_text(" ".join(card_parts))
+                # Token-delimited view for `_coverage`, and the document
+                # frequencies that weight it. BOTH must use the same tokenizer
+                # the constraint side uses: `_terms` strips the `%` and `.`
+                # that the normal form deliberately keeps inside numbers, so a
+                # plain split disagrees with it on exactly the numeric tokens
+                # ("100%" vs "100") that percentage constraints are made of.
+                tokens = set(_terms(self._norm_text[parent_asin]))
+                self._token_text[parent_asin] = " %s " % " ".join(sorted(tokens))
+                for token in tokens:
+                    doc_freq[token] = doc_freq.get(token, 0) + 1
                 anchor_key = normalize_text(coarse_category(product.get("categories") or []))
                 self._anchor_index.setdefault(anchor_key, []).append(parent_asin)
                 batch.append((
@@ -244,6 +368,10 @@ class Agent:
         if batch:
             cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
         self.connection.commit()
+        self._n_docs = len(self._products)
+        self._anchor_tokens = {
+            key: frozenset(_terms(key)) for key in self._anchor_index
+        }
         self._fallback_order = sorted(
             self._products,
             key=lambda parent_asin: (
@@ -252,6 +380,37 @@ class Agent:
                 parent_asin,
             ),
         )
+
+    @property
+    def _partial_min_idf(self) -> float:
+        """IDF of a token at `PARTIAL_IDF_QUANTILE` document frequency in *this*
+        catalog. Scales with catalog size instead of assuming 50k."""
+        return math.log(
+            (self._n_docs + 1.0) / (PARTIAL_IDF_QUANTILE * self._n_docs + 1.0)
+        )
+
+    def _idf(self, token: str) -> float:
+        """Smoothed inverse document frequency over the frozen catalog."""
+        return math.log((self._n_docs + 1.0) / (self._doc_freq.get(token, 0) + 1.0))
+
+    def _coverage(self, norm: str, token_text: str) -> float:
+        """IDF-weighted fraction of a constraint's content tokens present in
+        `token_text` (a product's `_token_text` entry). This is the graceful-
+        degradation path for a payload that has been reworded: 'Rubber sole' -> 'soles made of Rubber' keeps 'rubber',
+        which the whole-string substring test throws away entirely."""
+        tokens = set(_terms(norm))
+        if not tokens:
+            return 0.0
+        total = 0.0
+        hit = 0.0
+        for token in tokens:
+            weight = self._idf(token)
+            total += weight
+            if f" {token} " in token_text:
+                hit += weight
+        if FEATURE_PARTIAL_IDF_FLOOR and hit < self._partial_min_idf:
+            return 0.0
+        return hit / total if total else 0.0
 
     # -------------------------------------------------------------- interface
 
@@ -290,7 +449,7 @@ class Agent:
             }
         version = (
             len(state.constraints), len(state.loose_terms), len(state.category_terms),
-            state.budget_point, state.anchor is not None,
+            state.budget_point, state.anchor is not None, state.anchor_bonus,
             self._n_active(state), len(state.penalized), state.dissatisfied,
         )
         if state.cache_version == version and state.cache_ranking:
@@ -351,6 +510,13 @@ class Agent:
         rank-1 hits immediately. Escapes protect hit-rate unconditionally."""
         if turn >= GATE_CAP_TURN or state.drained >= 1 or state.dissatisfied:
             return limit
+        if FEATURE_REGIME_ESCAPE and self._matching_failed(state, ranked):
+            # Constraints exist but nothing matches them: the exact-substring
+            # path has failed (a reworded payload), so `informed` will never
+            # rise and deferring to GATE_CAP_TURN only burns turns. Impossible
+            # on the clean set — a card constraint is by construction a
+            # substring of the target, so the leader always matches ≥ 1.
+            return limit
         informed = 1 if state.budget_point is not None else 0
         if ranked:
             informed += state.memo.get(ranked[0], (0, 0.0, 0))[2]
@@ -360,6 +526,13 @@ class Agent:
             # A fully confident, fully informed buyer: no reason to defer.
             return limit
         return GATE_DEPTH
+
+    def _matching_failed(self, state: SessionState, ranked: list[str]) -> bool:
+        """True when ≥2 active constraints are held but the ranked leader
+        matches none of them — the signature of the paraphrase regime."""
+        if self._n_active(state) < 2 or not ranked:
+            return False
+        return state.memo.get(ranked[0], (0, 0.0, 0))[2] == 0
 
     def _mmr_diversify(self, ranked: list[str], limit: int) -> list[str]:
         """§5.3: on uninformed full-width turns only, avoid near-duplicate
@@ -484,15 +657,81 @@ class Agent:
             key = self._anchor_suffix(head)
             if key is None:
                 continue
-            asins = self._anchor_index[key]
-            state.anchor = tuple(asins)
-            state.anchor_set = frozenset(asins)
-            for term in _terms(key):
-                if term not in state.category_terms:
-                    state.category_terms.append(term)
+            self._install_anchor(state, key, ANCHOR_BONUS)
             self._apply_opening_tail(state, tail.strip())
             return True
+        if FEATURE_INFIX_ANCHOR:
+            # Exact key on any contiguous token window, longest first. Runs
+            # only after the suffix scan has failed, so clean-set behaviour is
+            # untouched by construction.
+            key = self._anchor_infix(candidates[-1][0])
+            if key is not None:
+                self._install_anchor(state, key, ANCHOR_BONUS)
+                return True
+        if FEATURE_FUZZY_ANCHOR:
+            # No exact category key: the tail was reworded. Union the closest
+            # keys into the candidate pool, but award NO anchor bonus — the
+            # best-overlap key is the wrong set often enough that boosting it
+            # is worse than having no anchor at all. Never fires on the clean
+            # set, where the opening carries the catalog's own category string
+            # verbatim.
+            head, tail = candidates[-1]
+            keys = self._fuzzy_anchor_keys(head)
+            if keys:
+                pool: list[str] = []
+                for key in keys:
+                    pool.extend(self._anchor_index[key])
+                    for term in _terms(key):
+                        if term not in state.category_terms:
+                            state.category_terms.append(term)
+                state.anchor = tuple(dict.fromkeys(pool))
+                state.anchor_set = frozenset()   # generation only, never scored
+                state.anchor_bonus = 0.0
+                self._apply_opening_tail(state, tail.strip())
+                return True
         return False
+
+    def _anchor_infix(self, text: str) -> str | None:
+        """Longest contiguous token window of `text` that is an exact category
+        key. Longest-first so 'rompers overalls jumpsuits' beats 'jumpsuits'."""
+        tokens = normalize_text(text).split()
+        for width in range(len(tokens), 0, -1):
+            for start in range(0, len(tokens) - width + 1):
+                key = " ".join(tokens[start:start + width])
+                if key not in self._anchor_index:
+                    continue
+                if width == 1 and (len(key) <= 2 or key in STOPWORDS):
+                    continue  # a lone short/function token is not a category
+                return key
+        return None
+
+    def _install_anchor(self, state: SessionState, key: str, bonus: float) -> None:
+        asins = self._anchor_index[key]
+        state.anchor = tuple(asins)
+        state.anchor_set = frozenset(asins)
+        state.anchor_bonus = bonus
+        for term in _terms(key):
+            if term not in state.category_terms:
+                state.category_terms.append(term)
+
+    def _fuzzy_anchor_keys(self, head: str) -> list[str]:
+        """Closest category keys by IDF-weighted token overlap. Recall only."""
+        tokens = set(_terms(head))
+        if not tokens:
+            return []
+        scored: list[tuple[float, str]] = []
+        for key, key_tokens in self._anchor_tokens.items():
+            shared = tokens & key_tokens
+            if not shared:
+                continue
+            total = sum(self._idf(token) for token in key_tokens)
+            if not total:
+                continue
+            score = sum(self._idf(token) for token in shared) / total
+            if score >= FUZZY_ANCHOR_MIN:
+                scored.append((score, key))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [key for _, key in scored[:FUZZY_ANCHOR_KEYS]]
 
     def _anchor_suffix(self, head: str) -> str | None:
         tokens = normalize_text(head).split()
@@ -549,11 +788,26 @@ class Agent:
         if not raw:
             return
         lowered = raw.lower()
-        is_budget = bool(_BUDGET_WORD_RE.search(lowered) or re.search(r"\$\s*\d", lowered))
+        if FEATURE_BUDGET_GUARD:
+            is_budget = len(raw) <= BUDGET_MAX_CHARS and bool(_BUDGET_PHRASE_RE.search(lowered))
+        else:
+            is_budget = bool(_BUDGET_WORD_RE.search(lowered) or re.search(r"\$\s*\d", lowered))
+        point = extract_budget_point(lowered) if is_budget else None
+        if is_budget and point is None:
+            # Never drop the text: fall through and keep it as lexical evidence.
+            is_budget = False
+        if (
+            not is_budget
+            and len(raw) <= BUDGET_MAX_CHARS
+            and _BUDGET_WORD_RE.search(lowered)
+            and not any(character.isdigit() for character in lowered)
+        ):
+            # A short, numberless budget disclosure ("budget around fifty
+            # dollars"): no price filter is possible and its words are pure
+            # noise to the lexical matcher, so it is dropped outright. Long
+            # strings are never dropped — that is the misrouting this guards.
+            return
         if is_budget:
-            point = extract_budget_point(lowered)
-            if point is None:
-                return  # no number → no price filter, and never substring-matched
             key = f"budget:{point}"
             if key in state.seen_keys:
                 return
@@ -591,18 +845,34 @@ class Agent:
         if state.anchor:
             pool.extend(state.anchor)
             seen.update(state.anchor)
-        query_terms: list[str] = []
-        for constraint in state.constraints:
-            query_terms.extend(_terms(constraint.verbatim))
-        query_terms.extend(state.category_terms)
-        query_terms.extend(state.loose_terms)
-        deduped = list(dict.fromkeys(query_terms))[:40]
-        if deduped:
-            expression = " OR ".join(f'"{term}"' for term in deduped)
-            for parent_asin in self._fts_search(expression, 300):
-                if parent_asin not in seen:
-                    seen.add(parent_asin)
-                    pool.append(parent_asin)
+        if FEATURE_MULTI_QUERY:
+            groups: list[list[str]] = [
+                _terms(constraint.verbatim) for constraint in state.constraints
+                if not constraint.is_budget
+            ]
+            groups.append(list(state.category_terms) + list(state.loose_terms))
+            for group in groups:
+                terms = list(dict.fromkeys(group))[:20]
+                if not terms:
+                    continue
+                expression = " OR ".join(f'"{term}"' for term in terms)
+                for parent_asin in self._fts_search(expression, MULTI_QUERY_LIMIT):
+                    if parent_asin not in seen:
+                        seen.add(parent_asin)
+                        pool.append(parent_asin)
+        else:
+            query_terms: list[str] = []
+            for constraint in state.constraints:
+                query_terms.extend(_terms(constraint.verbatim))
+            query_terms.extend(state.category_terms)
+            query_terms.extend(state.loose_terms)
+            deduped = list(dict.fromkeys(query_terms))[:40]
+            if deduped:
+                expression = " OR ".join(f'"{term}"' for term in deduped)
+                for parent_asin in self._fts_search(expression, 300):
+                    if parent_asin not in seen:
+                        seen.add(parent_asin)
+                        pool.append(parent_asin)
         if len(pool) < max(30, top_k * 3):
             for parent_asin in self._fallback_order:
                 if parent_asin not in seen:
@@ -641,6 +911,8 @@ class Agent:
                 state.memo[parent_asin] = entry
             if entry[0] < len(constraints):
                 text = self._norm_text.get(parent_asin, "")
+                card_text = self._card_text.get(parent_asin, "")
+                token_text = self._token_text.get(parent_asin, " ")
                 for constraint in constraints[entry[0]:]:
                     if constraint.is_budget:
                         continue
@@ -649,8 +921,24 @@ class Agent:
                         # matched but never penalizes when absent — that
                         # asymmetry is the §5.5 consistency gate.
                         entry[1] += constraint.weight
+                        if FEATURE_FIELD_WEIGHT and constraint.norm in card_text:
+                            entry[1] += constraint.weight * FIELD_WEIGHT_RATIO
                         if not constraint.demoted:
                             entry[2] += 1
+                        continue
+                    coverage = (
+                        self._coverage(constraint.norm, token_text)
+                        if FEATURE_PARTIAL_MATCH else 0.0
+                    )
+                    if coverage >= PARTIAL_MIN:
+                        # Sub-additive in coverage: a full substring match always
+                        # outscores any partial one, so clean-set ordering among
+                        # exact matches is untouched.
+                        entry[1] += constraint.weight * PARTIAL_SCALE * coverage * coverage
+                        if not constraint.demoted:
+                            entry[1] -= UNMATCHED_PENALTY * (1.0 - coverage)
+                            if coverage >= PARTIAL_COUNTS_AS_MATCH:
+                                entry[2] += 1
                     elif not constraint.demoted:
                         entry[1] -= UNMATCHED_PENALTY
                 entry[0] = len(constraints)
@@ -661,7 +949,7 @@ class Agent:
             score += 0.08 * float(product.get("average_rating") or 0.0)
             score += 0.05 * math.log1p(float(product.get("rating_number") or 0.0))
             if parent_asin in state.anchor_set:
-                score += ANCHOR_BONUS
+                score += state.anchor_bonus or ANCHOR_BONUS
             if (
                 FEATURE_PROFILE_PRIOR and not n_scorable
                 and state.budget_point is None and state.profile_tags
