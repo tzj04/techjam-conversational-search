@@ -98,6 +98,34 @@ case flips, budget rephrasing, reordering). An offline cache hook (`data/paraphr
 allows LLM-generated rewrites to be replayed with no network. The BM25 reference loses 19.5–24.3 points
 under it; the final agent loses 0.02–0.31.
 
+**L3 semantic-payload harness** (`tools/l3_paraphraser.py`, `tools/l3_eval.py`). L1 and L2 cannot
+support a robustness claim about *lexical matching*, and saying so precisely matters more than the
+0.959 headline: `_mutate_payload` returns `cat`, `attr` **and `old`** unchanged — so the
+`intent_override` opening's `old_value`, which is a real constraint (`soft[-1]`), is never touched —
+and `_mutate_constraint` does exactly two things, both no-ops against this agent by construction
+(budget rephrasing, bypassed because budget is regex-extracted and never substring-matched; a
+first-letter flip, erased by the lowercasing normal form). L2 tests frame parsing and payload
+splitting. It does not test payload matching at all.
+
+L3 rewrites payloads *semantically* — meaning-preserving, so a human reading them identifies the
+same product — using rules grounded in the actual public-set constraint distribution (800
+instances, 342 distinct, dominated by templated Amazon shapes: `<X> sole`, `<X> closure`,
+`N% <Material>`, `Machine Wash`, `color: <c>`). 60% of constraints mutate.
+
+```
+"Rubber sole"                → "soles made of Rubber"
+"Pull On closure"            → "pull on-style fastening"
+"Machine Wash; color: black" → "can go in the washing machine; black in colour"
+"95% Polyester, 5% Spandex"  → "Polyester (95 percent) blended with Spandex (5 percent)"
+```
+
+**L3a** leaves the category tail byte-identical so the anchor still resolves — the realistic
+"organizer added a paraphraser" scenario. **L3b** rewrites the tail too, so the anchor scan fails as
+well; it is a floor, not a forecast. Single-word constraints (276 of 800, 34.5%: `cotton`,
+`polyester`, `Imported`) are left alone by default — any faithful rewording keeps the head noun, and
+they are the floor under the degradation; `--mutate-singles` measures the harsher variant. The
+harness reproduces clean and L2 byte-exactly, which is its own correctness check.
+
 ## 4. Ablations and cut features
 
 Thresholds tuned on a stratified 151-session tune split; the 49-session validate split used only as
@@ -114,6 +142,42 @@ deltas on the full 200:
 | relaxation ladder (dissatisfaction-only) | 0 on clean | ship as failure insurance |
 
 Cut features remain in the code behind `FEATURE_*` flags (off) with their measured deltas recorded.
+
+### The two signals swap roles under paraphrase
+
+Ablating the anchor *properly* — emptying `_anchor_index`, which removes it from candidate
+generation as well as from the score; zeroing `ANCHOR_BONUS` alone under-ablates:
+
+| variant | clean | L3a (3 seeds) |
+|---|---|---|
+| full agent | 0.962179 (hit 1.000) | 0.887002 (hit 0.963) |
+| anchor fully removed | 0.945056 (hit 0.995) | 0.839783 (hit 0.933) |
+| | **−0.0171** | **−0.0472** |
+
+On the clean set the anchor is close to redundant — the substring reranker carries almost
+everything, though not quite all of it: hit-rate drops 1.000 → 0.995, so one session depends on the
+anchor outright. Under paraphrase, substring matching degrades and the anchor becomes the main
+carrier, **2.8× more load-bearing than on clean**. That role swap is the defence-in-depth the design
+argues for, stated as a number rather than asserted.
+
+### Gating's value is a slope, not a floor
+
+Recommendation gating is the single largest lever and the feature the submission rests on, so its
+behaviour under divergence matters more than its clean delta:
+
+| severity | gated | no gating | gating delta |
+|---|---|---|---|
+| clean | 0.962179 | 0.895986 | **+0.066193** |
+| L1 | 0.961979 | 0.893538 | +0.068441 |
+| L2 | 0.959033 | 0.892211 | +0.066822 |
+| L3a | 0.887002 (hit 0.963) | 0.852811 (hit 0.970) | **+0.034191** |
+
+Flat through L1 and L2 — neither touches payloads — then halving at L3a. The mechanism is visible
+in the hit-rate column: **removing gating raises hit-rate under paraphrase** (0.963 → 0.970).
+Gating buys rank by spending turns; when the ranking never becomes informed, that spend converts
+into pure hit-rate risk. The gate cannot tell, because its own `informed` test counts *exact*
+matches and so fails in the same correlated way the reranker does — which is what `REGIME_ESCAPE`
+(§4.1) exists to break.
 
 ## 5. Cost, latency, tokens
 
