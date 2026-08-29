@@ -1,0 +1,7 @@
+# The submission agent (submission/agent.py) runs on the Python 3 standard
+# library alone — no third-party packages are required at runtime or install
+# time. Python 3.12 tested; anything with sqlite3 FTS5 support (CPython 3.9+
+# default builds) works.
+#
+# The local analysis tools (tools/*.py, evaluator replay, paraphrase harness,
+# shadow evaluator) are likewise stdlib-only.
