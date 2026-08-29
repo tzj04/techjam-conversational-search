@@ -144,6 +144,21 @@ well; it is a floor, not a forecast. Single-word constraints (276 of 800, 34.5%:
 they are the floor under the degradation; `--mutate-singles` measures the harsher variant. The
 harness reproduces clean and L2 byte-exactly, which is its own correctness check.
 
+**catdrift** isolates what L3b conflates. `docs/headroom_and_robustness.md` §7 shows the anchor scan
+reading verbatim catalog text on every turn that no anchor is held; under L3b the same rewriter that
+drifts the opening's category also rewrites the payloads, so category words *inside* a payload drift
+in lockstep and that interaction cannot appear. `catdrift` rewrites the category tail and nothing
+else — which is also §6.2's named private-set risk, on its own, for the first time.
+
+**Synthetic-catalog harness** (`tools/synthetic_eval.py`): the shipped evaluator loop over a
+generated catalog of the same *shape* as the real one (the templated Amazon metadata of §3 above)
+with generated sessions in the released scenario mix. `data/catalog.jsonl` is a 50k release
+download, not repository content, so on a fresh checkout every other end-to-end instrument here is
+unavailable and a change has no way to show it did not break the conversation loop. `--against`
+replays two agent modules over identical sessions and diffs the per-session rank and hit turn. It is
+a regression detector, not a headroom measurement: a generated catalog has a far smaller vocabulary,
+so its absolute scores are not comparable to the public-set figures.
+
 ## 4. Ablations and cut features
 
 Thresholds tuned on a stratified 151-session tune split; the 49-session validate split used only as
@@ -315,7 +330,33 @@ cost is paid once at construction and does not touch the turn budget.
    change reaches them, and tuning for the two that would improve is overfitting to two sessions.
    Effort therefore went to robustness, where the measured headroom was ~9× larger. Full working:
    `docs/headroom_and_robustness.md`.
-6. **The budget path is entirely untested by every number in this report.** `intent_card` appends
+6. **Six ways to score zero that no number in this report could see.** Everything measured above is
+   about *ranking*. A separate audit (`docs/headroom_and_robustness.md` §7) found six live paths on
+   which the agent stops being an agent, none of them reachable from `tools/run_eval.py`: the
+   relative default catalog path resolving to nothing when the harness constructs `Agent()` from
+   another working directory; one malformed catalog row raising out of `__init__`; a rating shipped
+   as `"4.5 out of 5 stars"` doing the same; a SQLite build without FTS5 doing the same; sqlite3
+   thread affinity turning every query into a `ProgrammingError` in a threaded harness; and
+   `respond`'s bare `except Exception` converting all of the above into `recommendations: []`, a
+   guaranteed miss, with no error visible anywhere. Two of them depend only on how the organizer
+   *invokes* the agent, which `docs/agent_api_contract.json` does not specify. All six are fixed
+   with a reproduction each in `tests/test_robustness.py`; the catch-all now degrades to the
+   session's last good ranking and then to the popularity order, gated as the normal path would gate.
+7. **Two rank-level defects the clean set cannot reach.** `_try_opening` runs on every turn while no
+   anchor is held and scanned the *whole message*, so a payload ending in a category name installed
+   that category at the full `ANCHOR_BONUS` — the failure FUZZY_ANCHOR was cut for, through another
+   door — and on `intent_override` sessions it also swallowed the override, because the opening scan
+   was tried before the pivot test. Separately, the normal form deletes accented letters (`café` →
+   `caf`, `Damenmütze` → `damenm tze`) while the FTS5 index folds them and keeps the word whole
+   (`cafe`, `damenmutze`), so every query term built from an accented constraint matched nothing —
+   the same tokenizer disagreement Stage 4 fixed for `%` and `.`, with one instance left standing.
+   Both are unreachable on the clean set by construction, which is why no instrument here found them.
+   **Neither fix is re-measured on the real catalog**, which this checkout does not have. What stands
+   in: each is a no-op under the conditions every figure above was taken in, and across
+   clean/L2/L3a/L3b/catdrift × 5 seeds × 120 sessions (3,000 sessions) on `tools/synthetic_eval.py`
+   the per-session rank and hit turn are byte-identical before and after. The *frequency* of either
+   on the real 50k catalog is unmeasured.
+8. **The budget path is entirely untested by every number in this report.** `intent_card` appends
    `budget around $X` after the material/colour inserts and the features/details entries, so it
    falls outside `cleaned[:4]` for all 200 public targets: **zero budget constraints are ever
    revealed**. The same generator makes it equally unreachable on the private set, so the risk is
@@ -328,11 +369,14 @@ cost is paid once at construction and does not touch the turn budget.
 Python 3.12 tested; no third-party packages required (`requirements.txt`). Everything runs offline.
 
 ```bash
-python3 -m unittest discover -s tests                                  # 53 tests
+python3 -m unittest discover -s tests                                  # 106 tests
+python3 -m tools.synthetic_eval --seeds 0,1,2                          # runs without the catalog
+python3 -m tools.synthetic_eval --level catdrift --seeds 0,1,2
 python3 -m tools.run_eval --agent submission --output results.json     # full evaluation
 python3 -m tools.paraphrase_eval --agent submission.agent --level L2   # frame stress
 python3 -m tools.l3_eval --agent submission.agent --level L3a --seeds 0,1,2   # semantic stress
 python3 -m tools.l3_eval --agent submission.agent --level L3a --ablate anchor # role-swap ablation
+python3 -m tools.l3_eval --agent submission.agent --level catdrift            # category drift only
 python3 -m tools.shadow_evaluator --agent submission.agent             # rank-vs-turn curves
 python3 -m tools.demo_session --sample-id public_0003                  # the transcript below
 ```

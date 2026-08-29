@@ -157,12 +157,115 @@ every one of the 200 targets. Every measurement in the report leaves the entire
 budget path untested; the same generator makes it equally unreachable on the
 private set.
 
+## 7. The deployment audit: six ways to score zero with every number here unchanged
+
+Everything above measures the *ranking*. This section is the other axis: the
+ways the agent stops being an agent at all. Each of these was live, none is
+reachable from `tools/run_eval.py`, and each turns a 0.96 into a 0.00 without
+any instrument in this repository noticing.
+
+The common shape is that `respond` wraps `_respond` in a bare
+`except Exception` returning `recommendations: []`. That is a fail-*silent*
+path, not a fail-safe one: any fault anywhere becomes an empty list, and an
+empty list is a guaranteed miss.
+
+| # | Trigger | Old behaviour | Now |
+|---|---|---|---|
+| 1 | `Agent()` constructed from a working directory that is not the repo root | `data/catalog.jsonl` is a **relative** default; `_build_index` returns early, `_products` is empty, every session returns `[]` — no error anywhere | resolve against `$TECHJAM_CATALOG` and the path relative to `submission/agent.py`, which does not move; warn on stderr if still unresolved |
+| 2 | One malformed line, or one row without `parent_asin`, in the private catalog | `json.loads` / `KeyError` raises **out of `__init__`** | row skipped, counted in `Agent.skipped_rows` |
+| 3 | `average_rating: "4.5 out of 5 stars"` or `rating_number: "1,234"` | `float()` raises out of `__init__` (`_fallback_order` sort) | `_number()` reads the leading numeral; unreadable values sort last |
+| 4 | Host SQLite built without FTS5 | `CREATE VIRTUAL TABLE` raises out of `__init__` | `fts_enabled = False`; retrieval degrades to the anchor + popularity floor of §3, which is where 80.5% of the top-10 rate lives anyway |
+| 5 | Harness evaluates sessions on a worker thread | sqlite3 connections are thread-affine: `ProgrammingError` on every query, swallowed into `[]` for all 800 sessions | `check_same_thread=False` plus an `RLock` around the query |
+| 6 | Any internal fault on any turn | `recommendations: []` — a guaranteed miss | fall back to the session's last good ranking, then to the popularity order, gated exactly as the normal path would gate |
+
+Two of these (#1, #5) depend only on how the organizer *invokes* the agent, and
+neither is specified by `docs/agent_api_contract.json`. Reproductions for all
+six are in `tests/test_robustness.py`.
+
+### Two more that cost rank rather than everything
+
+**A wrong anchor taken out of a payload.** `_try_opening` runs on every turn
+while no anchor is held, and its longest candidate head is the whole message.
+So its *token suffix* is the tail of the payload, and a payload ending in a
+category name installs that category at the full `ANCHOR_BONUS`. That is
+precisely the failure FUZZY_ANCHOR was cut for — "a wrong anchor costs far more
+than no anchor" — reintroduced through a different door. Worse, on an
+`intent_override` session it also *swallows the override*: `_extract` tried the
+opening scan before the pivot test, so `_try_opening` returning `True` meant the
+prior evidence was never demoted and the new value never read. Fixed two ways:
+every anchor-scan head (suffix, infix and fuzzy alike) is clipped at the payload
+separator, and the pivot is tested first whenever there is prior evidence to
+override.
+
+This can only fire once the opening's category has failed to resolve, so it is
+unreachable on the clean set by construction — which is why no measurement here
+found it.
+
+**A tokenizer disagreement on accented text.** The normal form keeps `[a-z0-9]`
+only, so it deletes the accented letter and splits the word: `café` → `caf`,
+`Damenmütze` → `damenm tze`, `Bébé` → `` (dropped entirely). The FTS5 index is
+tokenized `unicode61 remove_diacritics 2`, which folds the accent and keeps the
+word whole: `cafe`, `damenmutze`, `bebe`. Every query term built from an
+accented constraint therefore matches **nothing**, and the fragments left behind
+pollute the document-frequency table that weights partial matching. This is the
+same class of bug as the `%`/`.` doc-frequency disagreement already fixed in
+Stage 4 — one instance of it was simply left standing. `FEATURE_UNICODE_FOLD`
+applies NFD and drops combining marks, which is the identity on ASCII.
+
+A third, latent: `_budget_score` read `price` with a bare `float()`, so a price
+shipped as `"$14.99"` was treated as *no price* and **penalised** the one product
+it was meant to match exactly. Dead weight today (§6: zero budget constraints
+are ever revealed), wrong whenever it is not.
+
+## 8. What is measured, and what is not
+
+`data/catalog.jsonl` is a release download, not repository content, so on a
+fresh checkout every end-to-end instrument here is unavailable. The figures in
+§§1–6 were taken when it was present; the fixes in §7 were not re-measured
+against it.
+
+Two things stand in for that:
+
+- **By construction.** Each §7 fix is a no-op under the conditions every figure
+  above was measured in — catalog present, one thread, FTS5 available, no
+  exception raised, ASCII text, and (for the anchor and pivot clips) an opening
+  whose category resolves on turn 1. None of them can move a number taken under
+  those conditions.
+- **By regression.** `tools/synthetic_eval.py` runs the shipped evaluator loop
+  over a generated catalog of the same *shape* (the templated Amazon metadata of
+  §5) with generated sessions in the released scenario mix. Across
+  clean/L2/L3a/L3b/catdrift × 5 seeds × 120 sessions — **3,000 sessions** — the
+  per-session rank and hit turn are byte-identical before and after. Absolute
+  scores there are not comparable to the public-set figures: a generated catalog
+  has a far smaller vocabulary, so constraint matching alone finds the target.
+
+What remains unmeasured is the *frequency* of the §7 rank failures on the real
+50k catalog: how many category keys occur as the token suffix of a features or
+details string, and how much accented text there is. Both are one command away
+once the catalog is present:
+
+```bash
+python3 -m tools.l3_eval --agent submission.agent --level L3b   --seeds 0,1,2
+python3 -m tools.l3_eval --agent submission.agent --level catdrift --seeds 0,1,2
+```
+
+`catdrift` is new here and isolates what L3b conflates: it rewrites the category
+tail and *nothing else*, leaving payloads byte-identical. REPORT §6.2 names
+spec-faithful card construction as the load-bearing assumption, and category
+replication is the part of it most likely to drift; under L3b the same rewriter
+also rewrites payloads, so category words *inside* a payload drift in lockstep
+with the opening's and the interaction above cannot appear.
+
 ## Reproduction
 
 ```bash
+python3 -m unittest discover -s tests                          # 106 tests
+python3 -m tools.synthetic_eval --seeds 0,1,2                  # no catalog needed
+python3 -m tools.synthetic_eval --level catdrift --seeds 0,1,2
 python3 -m tools.l3_eval --agent submission.agent --level L3a --seeds 0,1,2
 python3 -m tools.l3_eval --agent submission.agent --level L3b --seeds 0,1,2
 python3 -m tools.l3_eval --agent submission.agent --level L3a --ablate anchor
 python3 -m tools.l3_eval --agent submission.agent --level L3a --mutate-singles
+python3 -m tools.l3_eval --agent submission.agent --level catdrift --seeds 0,1,2
 python3 -m tools.shadow_evaluator --agent submission.agent   # rank-vs-turn curves
 ```

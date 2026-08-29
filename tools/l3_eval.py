@@ -54,7 +54,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="L3 semantic-paraphrase stress harness")
     parser.add_argument("--agent", default="submission.agent")
     parser.add_argument("--level", default="L3a",
-                        choices=["clean", "L1", "L2", "L3a", "L3b"])
+                        choices=["clean", "L1", "L2", "L3a", "L3b", "catdrift"])
     parser.add_argument("--seeds", default="0", help="comma-separated seeds")
     parser.add_argument("--ablate", default=None, choices=["anchor", "gating", "none"])
     parser.add_argument("--mutate-singles", action="store_true",

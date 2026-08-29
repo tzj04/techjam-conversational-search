@@ -18,8 +18,12 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import sqlite3
+import sys
+import threading
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -61,8 +65,8 @@ _PAYLOAD_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _SECONDARY_JOINER_RE = re.compile(r" and also |, plus ")
-# Override pivots open the message; scanning only the first 20 chars keeps
-# payload text (which starts at char ~21+ in every reply frame) out of reach.
+# Override pivots open the message. The window is clipped at the payload
+# separator so payload text can never reach the test (see `_pivot_window`).
 _OVERRIDE_TRIGGER_RE = re.compile(
     r"\b(actually|instead|forget|ignore|scratch|never ?mind|disregard"
     r"|change of plans|on second thought|drop that)\b"
@@ -90,17 +94,80 @@ _BOUNDARY_SPLIT_RE = re.compile(r"\. |\? |! | — |, ")
 _ATTRIBUTE_WORDS = [(attribute, attribute.replace("_", " ")) for attribute in ALLOWED_ATTRIBUTES]
 
 
+def _fold(text: str) -> str:
+    """Drop combining marks so the normal form and SQLite's FTS5 tokenizer
+    agree on the same alphabet.
+
+    The normal form keeps `[a-z0-9]` only, so it deletes an accented letter
+    outright ("café" -> "caf", "Damenmütze" -> "damenm tze", "Bébé" -> ""),
+    while the index is tokenized `unicode61 remove_diacritics 2`, which folds
+    the accent and keeps the word whole ("cafe", "damenmutze", "bebe"). Every
+    query term built from an accented constraint therefore matches nothing in
+    the index, and the fragments it leaves behind ("damenm", "tze") pollute the
+    document-frequency table that weights partial matching. This is the same
+    tokenizer disagreement already fixed once for `%` and `.` inside numbers.
+
+    NFD is canonical decomposition only and is the identity on ASCII input, so
+    this cannot move any figure measured on ASCII-only text."""
+    if text.isascii():
+        return text
+    return "".join(
+        character
+        for character in unicodedata.normalize("NFD", text)
+        if not unicodedata.combining(character)
+    )
+
+
 def normalize_text(text: str) -> str:
     """Shared normal form for product text and constraints (§1 fact 11)."""
-    return " ".join(_NORM_RE.sub(" ", (text or "").lower()).split())
+    lowered = (text or "").lower()
+    if FEATURE_UNICODE_FOLD:
+        lowered = _fold(lowered)
+    return " ".join(_NORM_RE.sub(" ", lowered).split())
 
 
 def _terms(text: str) -> list[str]:
+    lowered = (text or "").lower()
+    if FEATURE_UNICODE_FOLD:
+        lowered = _fold(lowered)
     return [
-        token.lower()
-        for token in TOKEN_RE.findall(text or "")
-        if len(token) > 1 and token.lower() not in STOPWORDS
+        token
+        for token in TOKEN_RE.findall(lowered)
+        if len(token) > 1 and token not in STOPWORDS
     ]
+
+
+_FIELD_NUMBER_RE = re.compile(r"-?\d[\d,]*\.?\d*")
+
+
+def _number(value: object) -> float | None:
+    """Best-effort float from a catalog field.
+
+    Amazon metadata ships these fields as plain numbers, as numeric strings,
+    and as decorated strings ("$14.99", "1,234", "4.5 out of 5 stars"). A bare
+    `float()` raises on the last two, and in `_build_index` that turned one
+    malformed row into a failed construction — i.e. a zero for the whole run."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    match = _FIELD_NUMBER_RE.search(str(value))
+    if not match:
+        return None
+    try:
+        return float(match.group(0).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _pivot_window(text: str, limit: int) -> str:
+    """The lead-in clause an override pivot may appear in.
+
+    Bounded twice: never past the payload separator, so payload text stays out
+    of reach (an ordinary reply whose *payload* says "instead" is not an
+    override — the original reason for the bound), and never more than `limit`
+    characters."""
+    return text.split(": ", 1)[0][:limit]
 
 
 def extract_budget_point(text: str) -> float | None:
@@ -244,6 +311,14 @@ FEATURE_FUZZY_ANCHOR = False
 # test -- so the correlated blindness this was built to break is already fixed
 # upstream by a feature that measures positive. Retained behind the flag.
 FEATURE_REGIME_ESCAPE = False
+# Fold combining marks in the shared normal form so it and the FTS5
+# `remove_diacritics 2` tokenizer agree on one alphabet (see `_fold`). NFD is
+# the identity on ASCII, so every figure in the report — all of which were
+# measured on ASCII-only text — is unmoved by construction. What it changes is
+# the accented tail of the catalog, where today the query side emits fragments
+# ("caf", "damenm", "tze") that cannot match the index. Wants a re-measurement
+# on the full catalog before the delta is claimed either way.
+FEATURE_UNICODE_FOLD = True
 # MULTI_QUERY: retrieval fires a single FTS query built as an OR of up to 40
 #   terms, so BM25 favours documents matching many *common* terms and a
 #   constraint whose vocabulary is rare can contribute no candidates at all.
@@ -286,6 +361,15 @@ GATE_FULL_MIN_TURN = 3     # …and it must be at least this turn, for full top-
 GATE_CAP_TURN = 5          # unconditional full top-k from this turn (hit-rate guard)
 GATE_DEPTH = 1             # list length while uninformed
 
+# Override pivot windows, in characters, both clipped at the payload separator.
+# Mid-conversation there is prior evidence and the message is a pivot frame, so
+# the window is generous. On the very first message there is nothing to override
+# and the text is an *opening* whose category and old-preference tail are catalog
+# strings that may themselves contain a pivot word ("Forget about sore feet"), so
+# the window stays at the historical 20 characters.
+PIVOT_WINDOW_CHARS = 60
+PIVOT_WINDOW_CHARS_OPENING = 20
+
 PROFILE_PRIOR_WEIGHT = 0.3
 STALE_PENALTY = 0.75
 MMR_DUP_PENALTY = 0.5
@@ -295,8 +379,17 @@ class Agent:
     """Deterministic exact-constraint agent (Stages 1–2 of plan.md)."""
 
     def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
-        self.catalog_path = Path(catalog_path)
-        self.connection = sqlite3.connect(":memory:")
+        self.catalog_path = self._resolve_catalog(catalog_path)
+        self.catalog_loaded = False
+        self.skipped_rows = 0
+        self.fts_enabled = True
+        # The connection is built once here and every read goes through
+        # `self._lock`. `check_same_thread=False` is what keeps a harness that
+        # evaluates sessions on a worker thread from raising ProgrammingError on
+        # every single query — an error `respond` would then swallow into an
+        # empty recommendation list, i.e. a silent zero for the entire run.
+        self._lock = threading.RLock()
+        self.connection = sqlite3.connect(":memory:", check_same_thread=False)
         self._sessions: dict[str, SessionState] = {}
         self._products: dict[str, dict] = {}
         self._norm_text: dict[str, str] = {}
@@ -311,23 +404,78 @@ class Agent:
 
     # ------------------------------------------------------------------ index
 
+    @staticmethod
+    def _resolve_catalog(catalog_path: str | Path) -> Path:
+        """Locate the catalog without assuming the harness's working directory.
+
+        The default argument is a *relative* path, so an organizer harness that
+        does `Agent()` from anywhere but the repository root indexes nothing,
+        returns an empty list on every turn, and scores zero — silently, because
+        `_build_index` simply returns when the file is absent. Fall back to
+        $TECHJAM_CATALOG and to the path relative to this module, which is fixed
+        wherever the process was started from."""
+        candidates = [Path(catalog_path)]
+        env_path = os.environ.get("TECHJAM_CATALOG")
+        if env_path:
+            candidates.append(Path(env_path))
+        root = Path(__file__).resolve().parent.parent
+        candidates.append(root / "data" / "catalog.jsonl")
+        if not Path(catalog_path).is_absolute():
+            candidates.append(root / catalog_path)
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    return candidate
+            except OSError:
+                continue
+        return Path(catalog_path)
+
     def _build_index(self) -> None:
         cursor = self.connection.cursor()
         doc_freq = self._doc_freq
-        cursor.execute(
-            "CREATE VIRTUAL TABLE products USING fts5("
-            "parent_asin UNINDEXED, title, categories, features, details, store, description, "
-            "tokenize='unicode61 remove_diacritics 2')"
-        )
-        if not self.catalog_path.exists():
+        try:
+            cursor.execute(
+                "CREATE VIRTUAL TABLE products USING fts5("
+                "parent_asin UNINDEXED, title, categories, features, details, store, description, "
+                "tokenize='unicode61 remove_diacritics 2')"
+            )
+        except sqlite3.Error:
+            # No FTS5 in this SQLite build. Degrade instead of failing
+            # construction: the category anchor and the popularity fallback are
+            # both computed here rather than in SQLite, and §3 of
+            # docs/headroom_and_robustness.md measures the anchor+popularity
+            # floor at 80.5% top-10. A hard failure here scores zero.
+            self.fts_enabled = False
+            print(
+                "[submission.agent] SQLite FTS5 unavailable; retrieval falls back "
+                "to the category anchor and the popularity order.",
+                file=sys.stderr,
+            )
+        if not self.catalog_path.is_file():
+            print(
+                f"[submission.agent] catalog not found at {self.catalog_path}; "
+                "the agent can only return an empty list. Pass an explicit path "
+                "or set TECHJAM_CATALOG.",
+                file=sys.stderr,
+            )
             return
         batch: list[tuple[str, ...]] = []
         with self.catalog_path.open(encoding="utf-8") as handle:
             for line in handle:
                 if not line.strip():
                     continue
-                product = json.loads(line)
-                parent_asin = str(product["parent_asin"])
+                # One malformed row must not cost the whole run. Before this,
+                # a bad line or a row without `parent_asin` raised straight out
+                # of __init__.
+                try:
+                    product = json.loads(line)
+                    parent_asin = str(product["parent_asin"])
+                except (ValueError, TypeError, KeyError):
+                    self.skipped_rows += 1
+                    continue
+                if not isinstance(product, dict):
+                    self.skipped_rows += 1
+                    continue
                 self._products[parent_asin] = product
                 parts = [str(product.get("title") or "")]
                 for field_name in ("features", "details", "description", "categories"):
@@ -353,6 +501,8 @@ class Agent:
                     doc_freq[token] = doc_freq.get(token, 0) + 1
                 anchor_key = normalize_text(coarse_category(product.get("categories") or []))
                 self._anchor_index.setdefault(anchor_key, []).append(parent_asin)
+                if not self.fts_enabled:
+                    continue
                 batch.append((
                     parent_asin,
                     str(product.get("title") or ""),
@@ -369,14 +519,15 @@ class Agent:
             cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
         self.connection.commit()
         self._n_docs = len(self._products)
+        self.catalog_loaded = bool(self._products)
         self._anchor_tokens = {
             key: frozenset(_terms(key)) for key in self._anchor_index
         }
         self._fallback_order = sorted(
             self._products,
             key=lambda parent_asin: (
-                -float(self._products[parent_asin].get("average_rating") or 0.0),
-                -float(self._products[parent_asin].get("rating_number") or 0.0),
+                -(_number(self._products[parent_asin].get("average_rating")) or 0.0),
+                -(_number(self._products[parent_asin].get("rating_number")) or 0.0),
                 parent_asin,
             ),
         )
@@ -423,18 +574,48 @@ class Agent:
             )
         self._sessions[session_id] = state
 
+    @staticmethod
+    def _safe_int(value: object, default: int, ceiling: int) -> int:
+        """The contract types `turn` and `top_k` as ints; a harness that hands
+        over a string or None used to take the whole turn down the catch-all."""
+        try:
+            return max(0, min(int(value), ceiling))
+        except (TypeError, ValueError):
+            return default
+
     def respond(self, session_id: str, user_message: str, turn: int, top_k: int) -> dict:
         try:
             return self._respond(session_id, user_message, turn, top_k)
         except Exception:
-            return {
-                "message": "Could you tell me one more must-have detail?",
-                "ask_attribute": "other",
-                "recommendations": [],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0},
-            }
+            return self._fallback_response(session_id, turn, top_k)
+
+    def _fallback_response(self, session_id: str, turn: int, top_k: int) -> dict:
+        """Answer with the best list still available instead of an empty one.
+
+        An internal fault used to return `recommendations: []`, which scores a
+        guaranteed zero for the turn; the evaluator applies no penalty for wrong
+        recommendations, so any list is weakly better. Falls back to this
+        session's last good ranking, then to the global popularity order — the
+        §3 floor. Gating is mirrored so a fault cannot lock in a bad rank that
+        the normal path would have deferred."""
+        limit = self._safe_int(top_k, 10, 1000)
+        turn = self._safe_int(turn, 1, 1000)
+        state = self._sessions.get(session_id)
+        ranked = list(state.cache_ranking) if state is not None and state.cache_ranking else []
+        if not ranked:
+            ranked = self._fallback_order
+        if FEATURE_GATING and turn < GATE_CAP_TURN:
+            limit = min(limit, GATE_DEPTH)
+        return {
+            "message": "Could you tell me one more must-have detail?",
+            "ask_attribute": "other",
+            "recommendations": [{"parent_asin": parent_asin} for parent_asin in ranked[:limit]],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+        }
 
     def _respond(self, session_id: str, user_message: str, turn: int, top_k: int) -> dict:
+        top_k = self._safe_int(top_k, 10, 1000)
+        turn = self._safe_int(turn, 1, 1000)
         state = self._sessions.get(session_id)
         if state is None:
             state = SessionState(profile={})
@@ -459,7 +640,7 @@ class Agent:
             ranked = self._score_pool(state, pool)
             state.cache_version = version
             state.cache_ranking = ranked
-        limit = max(0, int(top_k))
+        limit = top_k
         if FEATURE_GATING:
             limit = min(limit, self._gate_depth(state, turn, ranked, limit))
         if FEATURE_MMR and limit > 1 and self._n_active(state) == 0 and state.p_buy < 0.8:
@@ -574,10 +755,23 @@ class Agent:
             if attribute:
                 state.exhausted.add(attribute)
             return
+        # The override pivot is tested BEFORE the opening scan whenever there is
+        # prior evidence to override. Otherwise `_try_opening` reads the override
+        # message first, and once it reaches the infix scan — which happens
+        # exactly when the opening's category was reworded and no anchor is held
+        # — a category word inside the override's *payload* installs an anchor at
+        # the full ANCHOR_BONUS, and the override is never applied at all. That
+        # is the compound version of the failure FUZZY_ANCHOR was cut for: "a
+        # wrong anchor costs far more than no anchor".
+        if self._has_evidence(state) and _OVERRIDE_TRIGGER_RE.search(
+            _pivot_window(lowered, PIVOT_WINDOW_CHARS)
+        ):
+            self._apply_override(state, text)
+            return
         if state.anchor is None and self._try_opening(state, text):
             state.drained = 0
             return
-        if _OVERRIDE_TRIGGER_RE.search(lowered[:20]):
+        if _OVERRIDE_TRIGGER_RE.search(_pivot_window(lowered, PIVOT_WINDOW_CHARS_OPENING)):
             self._apply_override(state, text)
             return
         payload = self._reply_payload(text)
@@ -597,6 +791,17 @@ class Agent:
         for term in _terms(text):
             if term not in state.loose_terms:
                 state.loose_terms.append(term)
+
+    @staticmethod
+    def _has_evidence(state: SessionState) -> bool:
+        """True once the session holds anything an override could overturn.
+        False only on the first message, where the text is an opening."""
+        return bool(
+            state.anchor is not None
+            or state.constraints
+            or state.loose_terms
+            or state.category_terms
+        )
 
     def _strategy_switch(self, state: SessionState) -> None:
         """§5.5: the dissatisfaction reply is the ONLY trigger for the stale-rec
@@ -647,14 +852,24 @@ class Agent:
 
     def _try_opening(self, state: SessionState, text: str) -> bool:
         """Token-suffix anchor scan: the category tail is a suffix of the lead-in
-        clause under any verb rewording ("Help me track down {cat}")."""
+        clause under any verb rewording ("Help me track down {cat}").
+
+        Every head is clipped at the payload separator. The category is always
+        stated before it, and the longest candidate is the whole message: left
+        unclipped, its *token suffix* is the tail of the payload, so a payload
+        ending in a category name ("...pairs with Women Sports Bras") installs
+        that category as the anchor at the full bonus. On the clean set a
+        shorter candidate matches first, so the clip changes nothing there —
+        it only removes the wrong-anchor path that opens once the real category
+        has been reworded, which is the failure FUZZY_ANCHOR was cut for."""
+        lead_in = len(text.split(": ", 1)[0])
         candidates: list[tuple[str, str]] = []
         for match in _BOUNDARY_SPLIT_RE.finditer(text):
             candidates.append((text[:match.start()], text[match.end():]))
         candidates.append((text.rstrip(" .?!"), ""))
         candidates.sort(key=lambda item: len(item[0]))
         for head, tail in candidates:
-            key = self._anchor_suffix(head)
+            key = self._anchor_suffix(head[:lead_in])
             if key is None:
                 continue
             self._install_anchor(state, key, ANCHOR_BONUS)
@@ -663,8 +878,11 @@ class Agent:
         if FEATURE_INFIX_ANCHOR:
             # Exact key on any contiguous token window, longest first. Runs
             # only after the suffix scan has failed, so clean-set behaviour is
-            # untouched by construction.
-            key = self._anchor_infix(candidates[-1][0])
+            # untouched by construction. Scanned over the lead-in clause only:
+            # the category is always stated before the payload separator, and
+            # scanning past it lets a category word inside a payload install a
+            # wrong anchor at the full bonus.
+            key = self._anchor_infix(candidates[-1][0][:lead_in])
             if key is not None:
                 self._install_anchor(state, key, ANCHOR_BONUS)
                 return True
@@ -676,7 +894,7 @@ class Agent:
             # set, where the opening carries the catalog's own category string
             # verbatim.
             head, tail = candidates[-1]
-            keys = self._fuzzy_anchor_keys(head)
+            keys = self._fuzzy_anchor_keys(head[:lead_in])
             if keys:
                 pool: list[str] = []
                 for key in keys:
@@ -782,6 +1000,19 @@ class Agent:
         if match:
             for segment in self._split_payload(match.group(1)):
                 self._add_constraint(state, segment)
+            return
+        payload = self._reply_payload(text)
+        if payload is not None:
+            for segment in self._split_payload(payload):
+                self._add_constraint(state, segment)
+            return
+        # A pivot whose value frame is unrecognized: everything held has just
+        # been demoted, so discarding the new preference too leaves the session
+        # with no active evidence at all. Keep its words for retrieval.
+        pivot = _OVERRIDE_TRIGGER_RE.search(text.lower())
+        for term in _terms(text[pivot.end():] if pivot else text):
+            if term not in state.loose_terms:
+                state.loose_terms.append(term)
 
     def _add_constraint(self, state: SessionState, raw: str) -> None:
         raw = raw.strip()
@@ -883,15 +1114,19 @@ class Agent:
         return pool
 
     def _fts_search(self, expression: str, limit: int) -> list[str]:
-        if not expression:
+        if not expression or not self.fts_enabled:
             return []
         try:
-            rows = self.connection.execute(
-                "SELECT parent_asin FROM products WHERE products MATCH ? "
-                "ORDER BY bm25(products, 0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0) LIMIT ?",
-                (expression, limit),
-            ).fetchall()
-        except sqlite3.OperationalError:
+            with self._lock:
+                rows = self.connection.execute(
+                    "SELECT parent_asin FROM products WHERE products MATCH ? "
+                    "ORDER BY bm25(products, 0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0) LIMIT ?",
+                    (expression, limit),
+                ).fetchall()
+        # sqlite3.Error, not OperationalError: a ProgrammingError (connection
+        # misuse) must degrade retrieval to the anchor + popularity floor, not
+        # escape to `respond`'s catch-all and empty the list.
+        except sqlite3.Error:
             return []
         return [str(row[0]) for row in rows]
 
@@ -946,8 +1181,8 @@ class Agent:
             if n_scorable and entry[2] == n_scorable:
                 score += ALL_MATCHED_BONUS
             score += self._budget_score(state, product)
-            score += 0.08 * float(product.get("average_rating") or 0.0)
-            score += 0.05 * math.log1p(float(product.get("rating_number") or 0.0))
+            score += 0.08 * (_number(product.get("average_rating")) or 0.0)
+            score += 0.05 * math.log1p(max(0.0, _number(product.get("rating_number")) or 0.0))
             if parent_asin in state.anchor_set:
                 score += state.anchor_bonus or ANCHOR_BONUS
             if (
@@ -971,9 +1206,11 @@ class Agent:
         point = state.budget_point
         if point is None:
             return 0.0
-        try:
-            price = float(product.get("price"))
-        except (TypeError, ValueError):
+        # Amazon ships `price` as a number, as "14.99", and as "$14.99"; the old
+        # bare float() read the last of those as "no price" and *penalised* the
+        # product it was supposed to match exactly.
+        price = _number(product.get("price"))
+        if price is None:
             return -BUDGET_NO_PRICE_PENALTY
         if abs(price - point) <= max(0.01 * point, 0.01):
             return BUDGET_EXACT_BONUS

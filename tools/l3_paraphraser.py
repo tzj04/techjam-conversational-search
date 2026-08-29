@@ -16,6 +16,14 @@ Two levels, deliberately split:
 - **L3b** — the category tail is rewritten too, so the anchor scan fails as
   well. This is a floor, not a forecast: it models an evaluator whose category
   string no longer matches the catalog's own `categories` field.
+- **catdrift** — the category tail is rewritten and *nothing else is*. REPORT
+  §6.2 names spec-faithful card construction as the load-bearing assumption and
+  category replication as the part of it most likely to drift; L3b never
+  isolates that, because the same rewriter also rewrites the payloads, so the
+  category words that appear *inside* a payload drift in lockstep with the
+  opening's. Holding payloads byte-identical is what exposes the interaction:
+  the anchor scan runs on every turn while no anchor is held, and it is then
+  reading verbatim catalog text that can contain a category name.
 
 Rewrite rules are grounded in the actual public-set constraint distribution
 (800 instances, 342 distinct), which is dominated by a small set of templated
@@ -48,7 +56,7 @@ from tools.paraphraser import (
     Paraphraser,
 )
 
-L3_LEVELS = ("L3a", "L3b")
+L3_LEVELS = ("L3a", "L3b", "catdrift")
 MUTATION_RATE = 0.6
 
 _MATERIAL_WORDS = {
@@ -230,7 +238,8 @@ class L3Paraphraser(Paraphraser):
         if key == "attr":
             return value
         if key == "cat":
-            return rewrite_category(value, rng) if self.l3_level == "L3b" else value
+            drift = self.l3_level in ("L3b", "catdrift")
+            return rewrite_category(value, rng) if drift else value
         if key == "old":
             # The intent_override opening's `old_value` is a real constraint
             # (soft[-1]); L2 never touched it, which is part of why L2 is toothless.
@@ -245,6 +254,8 @@ class L3Paraphraser(Paraphraser):
         return value
 
     def _rewrite(self, value: str, rng: random.Random) -> str:
+        if self.l3_level == "catdrift":
+            return value  # category drift only; payloads stay verbatim
         budget = BUDGET_CONSTRAINT_RE.match(value)
         if budget:
             return rng.choice(BUDGET_VARIANTS).format(amt=budget.group("amt"))
